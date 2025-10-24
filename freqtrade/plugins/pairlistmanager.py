@@ -192,6 +192,7 @@ class PairListManager(LoggingMixin):
         :param keep_invalid: If sets to True, drops invalid pairs silently while expanding regexes.
         :return: pairlist - whitelisted pairs
         """
+        pairlist = self._exchange.normalize_pairs(list(pairlist))
         try:
             whitelist = expand_pairlist(pairlist, self._exchange.get_markets().keys(), keep_invalid)
         except ValueError as err:

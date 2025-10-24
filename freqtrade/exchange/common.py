@@ -64,7 +64,12 @@ SUPPORTED_EXCHANGES = [
     "kraken",
     "okx",
     "myokx",
+    "tushare",
 ]
+
+NON_CCXT_EXCHANGES = {
+    "tushare",
+}
 
 # either the main, or replacement methods (array) is required
 EXCHANGE_HAS_REQUIRED: dict[str, list[str]] = {

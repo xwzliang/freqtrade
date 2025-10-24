@@ -255,6 +255,7 @@ class RemotePairList(IPairList):
 
         self.log_once(f"Fetched pairs: {pairlist}", logger.debug)
 
+        pairlist = self._exchange.normalize_pairs(pairlist)
         pairlist = expand_pairlist(pairlist, list(self._exchange.get_markets().keys()))
         pairlist = self._whitelist_for_active_markets(pairlist)
         pairlist = pairlist[: self._number_pairs]

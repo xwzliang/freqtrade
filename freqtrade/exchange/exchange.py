@@ -551,6 +551,13 @@ class Exchange:
         """Return a pair's base currency (base/quote:settlement)"""
         return self.markets.get(pair, {}).get("base", "")
 
+    def normalize_pairs(self, pairs: list[str]) -> list[str]:
+        """
+        Normalize pair names to the exchange specific canonical format.
+        Default implementation returns the pair list unchanged.
+        """
+        return pairs
+
     def market_is_future(self, market: dict[str, Any]) -> bool:
         return (
             market.get(self._ft_has["ccxt_futures_name"], False) is True
