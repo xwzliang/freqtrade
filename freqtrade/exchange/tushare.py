@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from collections import deque
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -144,6 +146,10 @@ class Tushare(Exchange):
         self._markets_filter: list[str] = exchange_conf.get("stock_exchanges", [])
         self._timeframes_map = self._SUPPORTED_TIMEFRAMES.copy()
         self._last_metadata_fetch_ms: int = 0
+        rate_limit_conf = exchange_conf.get("rate_limit", {})
+        self._daily_rate_limit = int(rate_limit_conf.get("daily_limit_per_minute", 50))
+        self._daily_period = int(rate_limit_conf.get("daily_period_seconds", 60))
+        self._daily_call_times: deque[float] = deque()
 
         super().__init__(*args, validate=False, **kwargs)
 
@@ -423,7 +429,7 @@ class Tushare(Exchange):
             params["end_date"] = end
 
         try:
-            df = self._pro.daily(**params)
+            df = self._call_daily_with_rate_limit(params)
             logger.info(
                 "Fetched %s daily OHLCV entries for %s from Tushare (since: %s, until: %s).",
                 len(df) if df is not None else 0,
@@ -457,3 +463,28 @@ class Tushare(Exchange):
         if not ms:
             return None
         return datetime.fromtimestamp(ms / 1000, tz=UTC).strftime("%Y%m%d")
+
+    def _call_daily_with_rate_limit(self, params: dict[str, Any]):
+        """
+        Enforce Tushare documented rate limit of 50 calls per minute on the daily endpoint.
+        """
+        while True:
+            now = time.time()
+            while self._daily_call_times and now - self._daily_call_times[0] >= self._daily_period:
+                self._daily_call_times.popleft()
+
+            if len(self._daily_call_times) < self._daily_rate_limit:
+                break
+
+            wait = self._daily_period - (now - self._daily_call_times[0])
+            wait = max(wait, 0.0)
+            logger.info(
+                "Tushare daily rate limit reached (%s calls/%ss). Sleeping for %.2f seconds.",
+                self._daily_rate_limit,
+                self._daily_period,
+                wait,
+            )
+            time.sleep(wait if wait > 0 else 0.1)
+
+        self._daily_call_times.append(time.time())
+        return self._pro.daily(**params)
