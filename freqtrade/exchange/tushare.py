@@ -12,8 +12,10 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from pandas import DataFrame, concat
+from pandas import DataFrame, concat, to_datetime
+from pandas.api.types import is_datetime64_any_dtype
 
+from freqtrade.data.history import get_datahandler
 from freqtrade.enums import CandleType, MarginMode, TradingMode
 from freqtrade.exceptions import OperationalException, TemporaryError
 from freqtrade.exchange import Exchange
@@ -156,6 +158,12 @@ class Tushare(Exchange):
         # Override ccxt placeholders with supported timeframes
         self._api.timeframes = self._timeframes_map
         self._api_async.timeframes = self._timeframes_map
+
+        self._datadir = Path(self._config.get("datadir", "user_data/data"))
+        self._datadir.mkdir(parents=True, exist_ok=True)
+        self._datahandler = get_datahandler(
+            self._datadir, data_format=self._config.get("dataformat_ohlcv")
+        )
 
         self.reload_markets(force=True)
         self._set_startup_candle_count(self._config)
@@ -395,6 +403,7 @@ class Tushare(Exchange):
             df = self._process_ohlcv_df(
                 pair, timeframe, candle_type, ticks, cache, drop_incomplete
             )
+            self._store_cached_dataframe(pair, timeframe, df)
             results[(pair, timeframe, candle_type)] = df
 
         return results
@@ -417,6 +426,23 @@ class Tushare(Exchange):
                 f"Tushare supports only {', '.join(self._SUPPORTED_TIMEFRAMES)} timeframe(s). "
                 f"Requested: {timeframe}"
             )
+
+        cached_ticks = self._get_cached_ticks(pair, timeframe, since_ms)
+        if cached_ticks is not None:
+            return cached_ticks
+
+        key = (pair, timeframe, candle_type)
+        cached_df_full = self._klines.get(key)
+        if cached_df_full is not None and not cached_df_full.empty:
+            last_cached_dt = cached_df_full.iloc[-1]["date"]
+            if isinstance(last_cached_dt, datetime):
+                last_cached_dt = (
+                    last_cached_dt.astimezone(UTC)
+                    if last_cached_dt.tzinfo
+                    else last_cached_dt.replace(tzinfo=UTC)
+                )
+            last_cached_ms = int(last_cached_dt.timestamp() * 1000)
+            since_ms = max((since_ms or 0), last_cached_ms + 1)
 
         ts_code = pair.split("/")[0]
         start = self._ms_to_trade_date(since_ms)
@@ -463,6 +489,106 @@ class Tushare(Exchange):
         if not ms:
             return None
         return datetime.fromtimestamp(ms / 1000, tz=UTC).strftime("%Y%m%d")
+
+    def _get_cached_dataframe(self, pair: str, timeframe: str) -> DataFrame:
+        key = (pair, timeframe, CandleType.SPOT)
+        df = self._klines.get(key)
+        if df is not None and not df.empty:
+            return df
+
+        try:
+            df = self._datahandler.ohlcv_load(
+                pair, timeframe, candle_type=CandleType.SPOT
+            )
+        except FileNotFoundError:
+            df = DataFrame()
+        except Exception as exc:
+            logger.warning("Failed to load cached OHLCV for %s: %s", pair, exc)
+            df = DataFrame()
+
+        if df is None:
+            df = DataFrame()
+
+        if not df.empty:
+            if "date" in df.columns:
+                if not is_datetime64_any_dtype(df["date"]):
+                    df["date"] = to_datetime(df["date"], utc=True)
+                elif df["date"].dt.tz is None:
+                    df["date"] = df["date"].dt.tz_localize(UTC)
+            df = df.sort_values("date").reset_index(drop=True)
+            self._klines[key] = df
+
+        return df
+
+    def _get_cached_ticks(
+        self, pair: str, timeframe: str, since_ms: int | None
+    ) -> list[list] | None:
+        df = self._get_cached_dataframe(pair, timeframe)
+        if df.empty:
+            return None
+
+        since_dt = datetime.fromtimestamp(since_ms / 1000, tz=UTC) if since_ms else None
+        filtered = df[df["date"] >= since_dt] if since_dt else df
+        if filtered.empty:
+            return None
+
+        latest_date = filtered.iloc[-1]["date"]
+        if isinstance(latest_date, datetime):
+            latest_date = (
+                latest_date.astimezone(UTC)
+                if latest_date.tzinfo
+                else latest_date.replace(tzinfo=UTC)
+            )
+        today = datetime.now(UTC).date()
+
+        if since_dt is None:
+            logger.info(
+                "Using cached historical OHLCV for %s (%d rows).", pair, len(filtered)
+            )
+            return self._df_to_ticks(filtered)
+
+        if latest_date.date() >= today:
+            logger.debug(
+                "Using cached OHLCV for %s - latest candle %s.", pair, latest_date
+            )
+            return self._df_to_ticks(filtered)
+
+        return None
+
+    def _df_to_ticks(self, df: DataFrame) -> list[list]:
+        if df.empty:
+            return []
+        df_sorted = df.sort_values("date")
+        ticks: list[list] = []
+        for row in df_sorted.itertuples(index=False):
+            ts = row.date
+            if isinstance(ts, datetime):
+                ts_dt = ts.astimezone(UTC) if ts.tzinfo else ts.replace(tzinfo=UTC)
+            else:
+                ts_dt = datetime.fromtimestamp(ts, tz=UTC)
+            volume = getattr(row, "volume", getattr(row, "vol", 0))
+            ticks.append(
+                [
+                    int(ts_dt.timestamp() * 1000),
+                    row.open,
+                    row.high,
+                    row.low,
+                    row.close,
+                    volume,
+                ]
+            )
+        return ticks
+
+    def _store_cached_dataframe(self, pair: str, timeframe: str, df: DataFrame) -> None:
+        if df.empty:
+            return
+        try:
+            cleaned = df.drop_duplicates(subset="date", keep="last").reset_index(drop=True)
+            self._datahandler.ohlcv_store(
+                pair, timeframe, data=cleaned, candle_type=CandleType.SPOT
+            )
+        except Exception as exc:
+            logger.warning("Failed to store OHLCV cache for %s: %s", pair, exc)
 
     def _call_daily_with_rate_limit(self, params: dict[str, Any]):
         """
