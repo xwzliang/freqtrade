@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
 from functools import partial
@@ -10,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 from pandas import DataFrame, concat
-import rapidjson
 
 from freqtrade.enums import CandleType, MarginMode, TradingMode
 from freqtrade.exceptions import OperationalException, TemporaryError
@@ -99,6 +99,20 @@ class Tushare(Exchange):
         if not config:
             raise OperationalException("Missing configuration for Tushare exchange.")
         exchange_conf = kwargs.get("exchange_config") or config.get("exchange", {})
+
+        # Enforce spot trading mode since tushare only supports spot data.
+        if config.get("trading_mode") and config["trading_mode"] != TradingMode.SPOT.value:
+            logger.warning(
+                "Tushare exchange only supports spot mode. Overriding trading_mode=%s to spot.",
+                config["trading_mode"],
+            )
+        config["trading_mode"] = TradingMode.SPOT.value
+        if config.get("margin_mode") and config["margin_mode"] != MarginMode.NONE.value:
+            logger.warning(
+                "Tushare exchange does not support margin modes. Overriding margin_mode=%s to none.",
+                config["margin_mode"],
+            )
+        config["margin_mode"] = MarginMode.NONE.value
 
         try:
             import tushare as ts  # type: ignore[import]
@@ -248,20 +262,19 @@ class Tushare(Exchange):
             pairs_cfg.update(pairlist_conf.get("pair_whitelist", []))
             pairs_cfg.update(pairlist_conf.get("pairs", []))
 
-            if (
-                pairlist_conf.get("method") == "RemotePairList"
-                and pairlist_conf.get("pairlist_url", "").startswith("file:///")
-            ):
-                file_path = Path(pairlist_conf["pairlist_url"].split("file:///", 1)[1])
-                if file_path.exists():
-                    try:
-                        with file_path.open() as json_file:
-                            json_data = rapidjson.load(json_file)
-                        pairs_cfg.update(json_data.get("pairs", []))
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to load remote pairlist from %s: %s", file_path, exc
-                        )
+            if pairlist_conf.get("method") == "RemotePairList":
+                url = pairlist_conf.get("pairlist_url", "")
+                if url.startswith("file:///"):
+                    file_path = Path(url.split("file:///", 1)[1])
+                    if file_path.exists():
+                        try:
+                            with file_path.open() as json_file:
+                                data = json.load(json_file)
+                            pairs_cfg.update(data.get("pairs", []))
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to load remote pairlist from %s: %s", file_path, exc
+                            )
 
         pairs = self.normalize_pairs(list(pairs_cfg))
         if pairs:
@@ -342,6 +355,12 @@ class Tushare(Exchange):
         """
         Sequential version tailored for the synchronous tushare client.
         """
+        logger.debug(
+            "Tushare refresh_latest_ohlcv called for %d pairs (since_ms=%s, cache=%s).",
+            len(pair_list),
+            since_ms,
+            cache,
+        )
         results: dict = {}
         drop_incomplete = False if drop_incomplete is None else drop_incomplete
         for pair, timeframe, candle_type in set(pair_list):
@@ -355,8 +374,16 @@ class Tushare(Exchange):
                     last_date = cached_df.iloc[-1]["date"]
                     fetch_since = int(last_date.timestamp() * 1000) - timeframe_to_msecs(timeframe)
 
-            ticks = self._fetch_tushare_ohlcv(pair, timeframe, candle_type, fetch_since)
+            try:
+                ticks = self._fetch_tushare_ohlcv(pair, timeframe, candle_type, fetch_since)
+            except TemporaryError as exc:
+                logger.warning(
+                    "Failed to fetch OHLCV for %s due to temporary error: %s", pair, exc
+                )
+                continue
+
             if not ticks:
+                logger.debug("No OHLCV ticks returned for %s.", pair)
                 continue
 
             df = self._process_ohlcv_df(
@@ -389,12 +416,27 @@ class Tushare(Exchange):
         start = self._ms_to_trade_date(since_ms)
         end = self._ms_to_trade_date(until_ms) if until_ms else None
 
+        params: dict[str, Any] = {"ts_code": ts_code}
+        if start:
+            params["start_date"] = start
+        if end:
+            params["end_date"] = end
+
         try:
-            df = self._pro.daily(ts_code=ts_code, start_date=start, end_date=end)
+            df = self._pro.daily(**params)
+            logger.info(
+                "Fetched %s daily OHLCV entries for %s from Tushare (since: %s, until: %s).",
+                len(df) if df is not None else 0,
+                pair,
+                start,
+                end,
+            )
         except Exception as exc:  # pragma: no cover - API/network error
+            logger.warning("Tushare daily data request failed for %s: %s", pair, exc)
             raise TemporaryError(f"Tushare daily data request failed: {exc}") from exc
 
         if df is None or df.empty:
+            logger.warning("Tushare returned no daily data for %s (params: %s)", pair, params)
             return []
 
         df = df.sort_values("trade_date")
