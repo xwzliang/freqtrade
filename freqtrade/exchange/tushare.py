@@ -7,7 +7,7 @@ import json
 import logging
 import time
 from collections import deque
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -152,6 +152,7 @@ class Tushare(Exchange):
         self._daily_rate_limit = int(rate_limit_conf.get("daily_limit_per_minute", 50))
         self._daily_period = int(rate_limit_conf.get("daily_period_seconds", 60))
         self._daily_call_times: deque[float] = deque()
+        self._no_data_until: dict[str, datetime] = {}
 
         super().__init__(*args, validate=False, **kwargs)
 
@@ -448,6 +449,16 @@ class Tushare(Exchange):
         start = self._ms_to_trade_date(since_ms)
         end = self._ms_to_trade_date(until_ms) if until_ms else None
 
+        skip_until = self._no_data_until.get(pair)
+        now = datetime.now(UTC)
+        if skip_until and now < skip_until:
+            logger.debug(
+                "Skipping OHLCV fetch for %s until %s due to previous no-data response.",
+                pair,
+                skip_until,
+            )
+            return []
+
         params: dict[str, Any] = {"ts_code": ts_code}
         if start:
             params["start_date"] = start
@@ -469,6 +480,7 @@ class Tushare(Exchange):
 
         if df is None or df.empty:
             logger.warning("Tushare returned no daily data for %s (params: %s)", pair, params)
+            self._no_data_until[pair] = self._calculate_next_fetch_time()
             return []
 
         df = df.sort_values("trade_date")
@@ -482,6 +494,8 @@ class Tushare(Exchange):
             if until_ms and ts > until_ms:
                 break
             ticks.append([ts, row.open, row.high, row.low, row.close, row.vol])
+
+        self._no_data_until.pop(pair, None)
 
         return ticks
 
@@ -541,6 +555,7 @@ class Tushare(Exchange):
             )
         today = datetime.now(UTC).date()
 
+        now = datetime.now(UTC)
         if since_dt is None:
             logger.info(
                 "Using cached historical OHLCV for %s (%d rows).", pair, len(filtered)
@@ -550,6 +565,14 @@ class Tushare(Exchange):
         if latest_date.date() >= today:
             logger.debug(
                 "Using cached OHLCV for %s - latest candle %s.", pair, latest_date
+            )
+            return self._df_to_ticks(filtered)
+
+        if now.weekday() >= 5:
+            logger.debug(
+                "Weekend detected - using cached OHLCV for %s (latest candle %s).",
+                pair,
+                latest_date,
             )
             return self._df_to_ticks(filtered)
 
@@ -614,3 +637,14 @@ class Tushare(Exchange):
 
         self._daily_call_times.append(time.time())
         return self._pro.daily(**params)
+
+    def _calculate_next_fetch_time(self) -> datetime:
+        """
+        Determine when to retry fetching data after a no-data response.
+        """
+        next_attempt = datetime.now(UTC).replace(
+            hour=1, minute=0, second=0, microsecond=0
+        ) + timedelta(days=1)
+        while next_attempt.weekday() >= 5:
+            next_attempt += timedelta(days=1)
+        return next_attempt
