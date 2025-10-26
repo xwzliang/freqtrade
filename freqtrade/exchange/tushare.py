@@ -25,6 +25,11 @@ from freqtrade.util import dt_ts
 
 logger = logging.getLogger(__name__)
 
+try:
+    import holidays
+except ImportError:  # pragma: no cover - optional dependency
+    holidays = None
+
 
 class _TushareClientBase:
     """
@@ -152,6 +157,15 @@ class Tushare(Exchange):
         self._daily_rate_limit = int(rate_limit_conf.get("daily_limit_per_minute", 50))
         self._daily_period = int(rate_limit_conf.get("daily_period_seconds", 60))
         self._daily_call_times: deque[float] = deque()
+        self._holiday_country = exchange_conf.get("holiday_country", "CN")
+        self._copy_holiday_candles: bool = exchange_conf.get("copy_holiday_candles", False)
+        if self._copy_holiday_candles and holidays is None:
+            logger.warning(
+                "copy_holiday_candles is enabled but the 'holidays' package is not installed. "
+                "Disabling holiday candle copying."
+            )
+            self._copy_holiday_candles = False
+        self._holiday_cache: dict[int, Any] = {}
         self._no_data_until: dict[str, datetime] = {}
 
         super().__init__(*args, validate=False, **kwargs)
@@ -405,7 +419,9 @@ class Tushare(Exchange):
                 pair, timeframe, candle_type, ticks, cache, drop_incomplete
             )
             self._store_cached_dataframe(pair, timeframe, df)
-            results[(pair, timeframe, candle_type)] = df
+            results[(pair, timeframe, candle_type)] = self._apply_holiday_fill(
+                df.copy(), timeframe
+            )
 
         return results
 
@@ -458,6 +474,14 @@ class Tushare(Exchange):
                 skip_until,
             )
             return []
+
+        today_date = datetime.now(UTC).date()
+        if not self._is_trading_day(today_date):
+            logger.debug(
+                "Today (%s) is not a trading day. Skipping fetch for %s.", today_date, pair
+            )
+            self._no_data_until[pair] = self._calculate_next_fetch_time()
+            return self._get_cached_ticks(pair, timeframe, since_ms) or []
 
         params: dict[str, Any] = {"ts_code": ts_code}
         if start:
@@ -546,7 +570,8 @@ class Tushare(Exchange):
         if filtered.empty:
             return None
 
-        latest_date = filtered.iloc[-1]["date"]
+        filled_df = self._apply_holiday_fill(filtered.copy(), timeframe)
+        latest_date = filled_df.iloc[-1]["date"]
         if isinstance(latest_date, datetime):
             latest_date = (
                 latest_date.astimezone(UTC)
@@ -557,24 +582,24 @@ class Tushare(Exchange):
 
         now = datetime.now(UTC)
         if since_dt is None:
-            logger.info(
-                "Using cached historical OHLCV for %s (%d rows).", pair, len(filtered)
-            )
-            return self._df_to_ticks(filtered)
+            # logger.info(
+            #     "Using cached historical OHLCV for %s (%d rows).", pair, len(filled_df)
+            # )
+            return self._df_to_ticks(filled_df)
 
         if latest_date.date() >= today:
             logger.debug(
                 "Using cached OHLCV for %s - latest candle %s.", pair, latest_date
             )
-            return self._df_to_ticks(filtered)
+            return self._df_to_ticks(filled_df)
 
-        if now.weekday() >= 5:
+        if not self._is_trading_day(now.date()):
             logger.debug(
-                "Weekend detected - using cached OHLCV for %s (latest candle %s).",
+                "Non-trading day detected - using cached OHLCV for %s (latest candle %s).",
                 pair,
                 latest_date,
             )
-            return self._df_to_ticks(filtered)
+            return self._df_to_ticks(filled_df)
 
         return None
 
@@ -613,6 +638,54 @@ class Tushare(Exchange):
         except Exception as exc:
             logger.warning("Failed to store OHLCV cache for %s: %s", pair, exc)
 
+    def _apply_holiday_fill(self, df: DataFrame, timeframe: str) -> DataFrame:
+        if (
+            not self._copy_holiday_candles
+            or timeframe.lower() != "1d"
+            or df.empty
+            or "date" not in df.columns
+        ):
+            return df
+
+        filled = df.copy()
+        filled["date"] = to_datetime(filled["date"], utc=True)
+        last_date = filled.iloc[-1]["date"]
+        today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+        while last_date.date() < today.date():
+            next_date = last_date + timedelta(days=1)
+            if self._is_trading_day(next_date.date()):
+                break
+            new_row = filled.iloc[-1].copy()
+            new_row["date"] = next_date
+            filled = concat([filled, DataFrame([new_row])], ignore_index=True)
+            last_date = next_date
+
+        return filled
+
+    def _is_trading_day(self, day) -> bool:
+        if day.weekday() >= 5:
+            return False
+        if holidays is None:
+            return True
+        cal = self._holiday_cache.get(day.year)
+        if cal is None:
+            try:
+                cal = holidays.country_holidays(self._holiday_country, years=day.year)
+            except Exception as exc:  # pragma: no cover - network/holiday error
+                logger.debug(
+                    "Could not load holidays for %s/%s: %s",
+                    self._holiday_country,
+                    day.year,
+                    exc,
+                )
+                cal = {}
+            self._holiday_cache[day.year] = cal
+        try:
+            return day not in cal
+        except TypeError:
+            return day not in set(cal)
+
     def _call_daily_with_rate_limit(self, params: dict[str, Any]):
         """
         Enforce Tushare documented rate limit of 50 calls per minute on the daily endpoint.
@@ -645,6 +718,6 @@ class Tushare(Exchange):
         next_attempt = datetime.now(UTC).replace(
             hour=1, minute=0, second=0, microsecond=0
         ) + timedelta(days=1)
-        while next_attempt.weekday() >= 5:
+        while not self._is_trading_day(next_attempt.date()):
             next_attempt += timedelta(days=1)
         return next_attempt
