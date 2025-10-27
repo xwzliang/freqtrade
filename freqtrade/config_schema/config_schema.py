@@ -927,6 +927,16 @@ CONF_SCHEMA = {
                     "type": "string",
                     "default": "CN",
                 },
+                "market_close_time": {
+                    "description": "Market close time in HH:MM (market timezone).",
+                    "type": "string",
+                    "default": "15:30",
+                },
+                "market_timezone": {
+                    "description": "Timezone name for the market (IANA identifier).",
+                    "type": "string",
+                    "default": "Asia/Shanghai",
+                },
                 "markets_refresh_interval": {
                     "description": "Interval for refreshing market data in minutes.",
                     "type": "integer",

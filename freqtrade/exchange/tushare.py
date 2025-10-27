@@ -7,7 +7,7 @@ import json
 import logging
 import time
 from collections import deque
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, time as dt_time
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,7 @@ from freqtrade.constants import BuySell
 from freqtrade.exchange.exchange_utils import ROUND_DOWN, ROUND_UP
 from freqtrade.exchange.exchange_utils_timeframe import timeframe_to_msecs
 from freqtrade.util import dt_ts
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,19 @@ class Tushare(Exchange):
             )
             self._copy_holiday_candles = False
         self._holiday_cache: dict[int, Any] = {}
+        tz_name = exchange_conf.get("market_timezone", "Asia/Shanghai")
+        try:
+            self._market_timezone = ZoneInfo(tz_name)
+        except Exception:
+            logger.warning("Invalid market_timezone '%s'. Falling back to Asia/Shanghai", tz_name)
+            self._market_timezone = ZoneInfo("Asia/Shanghai")
+        close_time_str = exchange_conf.get("market_close_time", "15:30")
+        try:
+            close_hour, close_minute = [int(x) for x in close_time_str.split(":", 1)]
+            self._market_close_time = dt_time(close_hour, close_minute)
+        except Exception:
+            logger.warning("Invalid market_close_time '%s'. Falling back to 15:30", close_time_str)
+            self._market_close_time = dt_time(15, 30)
         self._no_data_until: dict[str, datetime] = {}
 
         super().__init__(*args, validate=False, **kwargs)
@@ -583,8 +597,8 @@ class Tushare(Exchange):
         end = self._ms_to_trade_date(until_ms) if until_ms else None
 
         skip_until = self._no_data_until.get(pair)
-        now = datetime.now(UTC)
-        if skip_until and now < skip_until:
+        now_utc = datetime.now(UTC)
+        if skip_until and now_utc < skip_until:
             logger.debug(
                 "Skipping OHLCV fetch for %s until %s due to previous no-data response.",
                 pair,
@@ -592,13 +606,25 @@ class Tushare(Exchange):
             )
             return []
 
-        today_date = datetime.now(UTC).date()
+        now_market = datetime.now(self._market_timezone)
+        today_date = now_market.date()
         if not self._is_trading_day(today_date):
             logger.debug(
                 "Today (%s) is not a trading day. Skipping fetch for %s.", today_date, pair
             )
             self._no_data_until[pair] = self._calculate_next_fetch_time()
             return self._get_cached_ticks(pair, timeframe, since_ms) or []
+
+        close_dt_market = datetime.combine(today_date, self._market_close_time, tzinfo=self._market_timezone)
+        if now_market < close_dt_market:
+            logger.debug(
+                "Market still open (closes %s). Using cached data for %s.",
+                close_dt_market,
+                pair,
+            )
+            cached_ticks = self._get_cached_ticks(pair, timeframe, since_ms)
+            self._no_data_until[pair] = close_dt_market.astimezone(UTC)
+            return cached_ticks or []
 
         params: dict[str, Any] = {"ts_code": ts_code}
         if start:
@@ -843,9 +869,12 @@ class Tushare(Exchange):
         """
         Determine when to retry fetching data after a no-data response.
         """
-        next_attempt = datetime.now(UTC).replace(
-            hour=1, minute=0, second=0, microsecond=0
-        ) + timedelta(days=1)
-        while not self._is_trading_day(next_attempt.date()):
-            next_attempt += timedelta(days=1)
-        return next_attempt
+        now_market = datetime.now(self._market_timezone)
+        next_market = datetime.combine(
+            now_market.date(), self._market_close_time, tzinfo=self._market_timezone
+        )
+        if now_market >= next_market:
+            next_market += timedelta(days=1)
+        while not self._is_trading_day(next_market.date()):
+            next_market += timedelta(days=1)
+        return next_market.astimezone(UTC)
