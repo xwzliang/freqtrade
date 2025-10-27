@@ -1301,11 +1301,23 @@ class IStrategy(ABC, HyperStrategyMixin):
         # Check if dataframe is out of date
         timeframe_minutes = timeframe_to_minutes(timeframe)
         offset = self.config.get("exchange", {}).get("outdated_offset", 5)
-        if latest_date < (dt_now() - timedelta(minutes=timeframe_minutes * 2 + offset)):
+        now_dt = dt_now()
+        age_minutes = int((now_dt - latest_date).total_seconds() // 60)
+        max_age = timeframe_minutes * 2 + offset
+        if age_minutes > max_age:
+            if timeframe_minutes >= 1440 and (
+                now_dt.weekday() >= 5 or age_minutes <= timeframe_minutes * 3
+            ):
+                logger.debug(
+                    "Ignoring outdated warning for %s: age=%s minutes (weekend/holiday allowance).",
+                    pair,
+                    age_minutes,
+                )
+                return latest, latest_date
             logger.warning(
                 "Outdated history for pair %s. Last tick is %s minutes old",
                 pair,
-                int((dt_now() - latest_date).total_seconds() // 60),
+                age_minutes,
             )
             return None, None
         return latest, latest_date

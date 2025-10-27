@@ -17,9 +17,11 @@ from pandas.api.types import is_datetime64_any_dtype
 
 from freqtrade.data.history import get_datahandler
 from freqtrade.enums import CandleType, MarginMode, TradingMode
-from freqtrade.exceptions import OperationalException, TemporaryError
+from freqtrade.exceptions import OperationalException, PricingError, TemporaryError
 from freqtrade.exchange import Exchange
 from freqtrade.exchange.exchange_types import FtHas, OHLCVResponse
+from freqtrade.constants import BuySell
+from freqtrade.exchange.exchange_utils import ROUND_DOWN, ROUND_UP
 from freqtrade.exchange.exchange_utils_timeframe import timeframe_to_msecs
 from freqtrade.util import dt_ts
 
@@ -91,6 +93,8 @@ class Tushare(Exchange):
         "tickers_have_percentage": False,
         "tickers_have_bid_ask": False,
         "tickers_have_quoteVolume": False,
+        "stoploss_on_exchange": True,
+        "stoploss_order_types": {"market": "market", "limit": "limit"},
     }
 
     _supported_trading_mode_margin_pairs: list[tuple[TradingMode, MarginMode]] = [
@@ -249,6 +253,12 @@ class Tushare(Exchange):
                 "active": (row.get("list_status") or "L").upper() == "L",
                 "type": "spot",
                 "spot": True,
+                "precision": {"price": 4, "amount": 0},
+                "limits": {
+                    "amount": {"min": 1.0, "max": None},
+                    "price": {"min": None, "max": None},
+                    "cost": {"min": 0.0, "max": None},
+                },
                 "info": row,
             }
 
@@ -424,6 +434,113 @@ class Tushare(Exchange):
             )
 
         return results
+    def get_rate(
+        self,
+        pair: str,
+        *,
+        side: str = "entry",
+        is_short: bool = False,
+        refresh: bool = False,
+        price_type: str = "last",
+        order_type: str | None = None,
+        price: float | None = None,
+    ) -> float:
+        """
+        Return latest price for the pair without relying on orderbook/ticker endpoints.
+        """
+        if refresh:
+            # Ensure cache is up-to-date when explicitly requested.
+            self.refresh_latest_ohlcv(
+                [(pair, self._config.get("timeframe", "1d"), CandleType.SPOT)],
+                cache=True,
+            )
+
+        price_value = self._get_latest_price(pair)
+        if price_value is None:
+            raise PricingError(f"Price data unavailable for {pair}.")
+        return price_value
+
+    def fetch_l2_order_book(self, pair: str, limit: int | None = None) -> dict[str, Any]:
+        """
+        Provide a minimal synthetic order book for compatibility with freqtrade core logic.
+        """
+        price_value = self._get_latest_price(pair)
+        if price_value is None:
+            raise PricingError(f"Order book unavailable for {pair}.")
+
+        depth = max(limit or 1, 1)
+        bids = [[price_value, 1.0] for _ in range(depth)]
+        asks = [[price_value, 1.0] for _ in range(depth)]
+        now_ms = dt_ts()
+        return {
+            "symbol": pair,
+            "bids": bids,
+            "asks": asks,
+            "timestamp": now_ms,
+            "datetime": datetime.fromtimestamp(now_ms / 1000, tz=UTC).isoformat(),
+            "nonce": None,
+        }
+
+    def fetch_ticker(self, pair: str) -> dict[str, Any]:
+        """
+        Return a minimal ticker structure used by freqtrade for pricing.
+        """
+        price_value = self._get_latest_price(pair)
+        if price_value is None:
+            raise PricingError(f"Ticker unavailable for {pair}.")
+        now_ms = dt_ts()
+        return {
+            "symbol": pair,
+            "bid": price_value,
+            "ask": price_value,
+            "last": price_value,
+            "close": price_value,
+            "timestamp": now_ms,
+            "datetime": datetime.fromtimestamp(now_ms / 1000, tz=UTC).isoformat(),
+        }
+
+    def get_fee(
+        self,
+        symbol: str,
+        order_type: str = "",
+        side: str = "",
+        amount: float = 1.0,
+        price: float = 1.0,
+        taker_or_maker: str = "taker",
+    ) -> float:
+        """Return a simplified fee rate for tushare (defaults to config fee or zero)."""
+        config_fee = self._config.get("fee")
+        if self._config.get("dry_run") and config_fee is not None:
+            return config_fee
+        if isinstance(config_fee, (int, float)) and config_fee is not None:
+            return float(config_fee)
+        return 0.0
+
+    def create_stoploss(
+        self,
+        pair: str,
+        amount: float,
+        stop_price: float,
+        order_types: dict,
+        side: BuySell,
+        leverage: float,
+    ) -> dict[str, Any]:
+        """Create a synthetic stoploss order for dry-run support."""
+        if not self._config.get("dry_run", False):
+            raise OperationalException("Tushare stoploss is only available in dry_run mode.")
+
+        round_mode = ROUND_DOWN if side == "buy" else ROUND_UP
+        stop_price_norm = self.price_to_precision(pair, stop_price, rounding_mode=round_mode)
+
+        return self.create_dry_run_order(
+            pair,
+            order_types.get("stoploss", "market"),
+            side,
+            amount,
+            stop_price_norm,
+            stop_loss=True,
+            leverage=leverage,
+        )
 
     def _fetch_tushare_ohlcv(
         self,
@@ -637,6 +754,17 @@ class Tushare(Exchange):
             )
         except Exception as exc:
             logger.warning("Failed to store OHLCV cache for %s: %s", pair, exc)
+
+    def _get_latest_price(self, pair: str) -> float | None:
+        timeframe = self._config.get("timeframe", "1d")
+        df = self._get_cached_dataframe(pair, timeframe)
+        if df.empty:
+            return None
+        latest_row = df.iloc[-1]
+        try:
+            return float(latest_row["close"])
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def _apply_holiday_fill(self, df: DataFrame, timeframe: str) -> DataFrame:
         if (

@@ -913,6 +913,20 @@ CONF_SCHEMA = {
                     "type": "integer",
                     "minimum": 1,
                 },
+                "copy_holiday_candles": {
+                    "description": (
+                        "Copy the previous trading day's candle in memory for holidays and weekends."
+                    ),
+                    "type": "boolean",
+                    "default": False,
+                },
+                "holiday_country": {
+                    "description": (
+                        "Country code used for holiday detection (requires the 'holidays' package)."
+                    ),
+                    "type": "string",
+                    "default": "CN",
+                },
                 "markets_refresh_interval": {
                     "description": "Interval for refreshing market data in minutes.",
                     "type": "integer",
