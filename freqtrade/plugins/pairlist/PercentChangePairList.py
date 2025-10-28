@@ -8,12 +8,13 @@ defined period or as coming from ticker
 
 import json
 import logging
-from datetime import date, timedelta
+import math
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, Any
 
 from cachetools import TTLCache
-from pandas import DataFrame, to_datetime
+from pandas import DataFrame, Timestamp, to_datetime
 
 from freqtrade.constants import ListPairsWithTimeframes, PairWithTimeframe
 from freqtrade.exceptions import OperationalException, PricingError
@@ -66,6 +67,29 @@ class PercentChangePairList(IPairList):
         self._baseline_date: date | None = None
         self._sort_direction: str | None = self._pairlistconfig.get("sort_direction", "desc")
         self._def_candletype = self._config["candle_type_def"]
+        self._use_candle_any_match: bool = self._pairlistconfig.get("use_candle_any_match", False)
+        lookback_cache_dir_cfg = self._pairlistconfig.get(
+            "lookback_cache_dir", "/freqtrade/user_data/percent_lookback"
+        )
+        default_lookback_dir = (
+            Path(self._config.get("datadir", "user_data/data")) / "percent_lookback"
+        )
+        self._lookback_cache_dir = (
+            Path(lookback_cache_dir_cfg) if lookback_cache_dir_cfg else default_lookback_dir
+        )
+        self._lookback_cache_dir.mkdir(parents=True, exist_ok=True)
+        self._lookback_cache_file: Path | None = None
+        self._lookback_cache_date: date | None = None
+        self._lookback_cache_data: dict[str, dict[str, Any]] = {}
+        self._percentage_cache: dict[str, dict[str, Any]] = {}
+        save_path = self._pairlistconfig.get("save_to_file")
+        append_path = self._pairlistconfig.get("append_to_file")
+        self._save_to_file: Path | None = Path(save_path) if save_path else None
+        self._append_to_file: Path | None = Path(append_path) if append_path else None
+        if self._save_to_file:
+            self._save_to_file.parent.mkdir(parents=True, exist_ok=True)
+        if self._append_to_file:
+            self._append_to_file.parent.mkdir(parents=True, exist_ok=True)
 
         if (self._lookback_days > 0) & (self._lookback_period > 0):
             raise OperationalException(
@@ -197,6 +221,30 @@ class PercentChangePairList(IPairList):
                 "description": "Directory to persist baseline prices.",
                 "help": "Optional directory to store baseline cache files.",
             },
+            "use_candle_any_match": {
+                "type": "boolean",
+                "default": False,
+                "description": "Select pairs if any candle in the lookback window matches thresholds.",
+                "help": "When enabled, a single candle exceeding the configured limits is enough to include the pair.",
+            },
+            "lookback_cache_dir": {
+                "type": "string",
+                "default": "",
+                "description": "Directory to persist lookback evaluation cache.",
+                "help": "Optional directory to store lookback candle cache files.",
+            },
+            "save_to_file": {
+                "type": "string",
+                "default": "",
+                "description": "File path to store resulting pairlist JSON.",
+                "help": "If provided, the resulting pair list is written to the given path.",
+            },
+            "append_to_file": {
+                "type": "string",
+                "default": "",
+                "description": "File path to append resulting pairs into existing JSON.",
+                "help": "Pairs will be merged into the existing JSON file without duplicates.",
+            },
         }
 
     def gen_pairlist(self, tickers: Tickers) -> list[str]:
@@ -287,10 +335,10 @@ class PercentChangePairList(IPairList):
         for entry in filtered_tickers:
             pct = entry["percentage"]
             if pct is None:
-                self.log_once(
-                    f"Removed {entry['symbol']} from whitelist, because percentage could not be calculated.",
-                    logger.info,
-                )
+                # self.log_once(
+                #     f"Removed {entry['symbol']} from whitelist, because percentage could not be calculated.",
+                #     logger.info,
+                # )
                 continue
 
             include = True
@@ -341,11 +389,67 @@ class PercentChangePairList(IPairList):
         # Limit pairlist to the requested number of pairs
         pairs = pairs[: self._number_pairs]
 
+        self._persist_result(pairs)
         return pairs
 
+    def _persist_result(self, pairs: list[str]) -> None:
+        payload = {"pairs": pairs, "refresh_period": self._refresh_period}
+        if self._save_to_file:
+            try:
+                with self._save_to_file.open("w", encoding="utf-8") as fp:
+                    json.dump(payload, fp, ensure_ascii=False, indent=2)
+                logger.info(
+                    "PercentChangePairList saved %d pairs to %s.",
+                    len(pairs),
+                    self._save_to_file,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "PercentChangePairList failed to save pairlist to %s: %s",
+                    self._save_to_file,
+                    exc,
+                )
+
+        if self._append_to_file:
+            existing = {"pairs": []}
+            if self._append_to_file.exists():
+                try:
+                    with self._append_to_file.open("r", encoding="utf-8") as fp:
+                        existing = json.load(fp) or {}
+                except Exception:
+                    logger.warning(
+                        "PercentChangePairList could not read existing file %s. Overwriting.",
+                        self._append_to_file,
+                    )
+                    existing = {"pairs": []}
+            existing_pairs = set(existing.get("pairs", []))
+            initial_len = len(existing_pairs)
+            for pair in pairs:
+                existing_pairs.add(pair)
+            merged_payload = {
+                "pairs": sorted(existing_pairs),
+                "refresh_period": self._refresh_period,
+            }
+            try:
+                with self._append_to_file.open("w", encoding="utf-8") as fp:
+                    json.dump(merged_payload, fp, ensure_ascii=False, indent=2)
+                logger.info(
+                    "PercentChangePairList appended %d new pairs to %s.",
+                    len(existing_pairs) - initial_len,
+                    self._append_to_file,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "PercentChangePairList failed to append pairlist to %s: %s",
+                    self._append_to_file,
+                    exc,
+                )
+
     def fetch_candles_for_lookback_period(
-        self, filtered_tickers: list[SymbolWithPercentage]
+        self, filtered_tickers: list[SymbolWithPercentage], symbols_to_fetch: set[str]
     ) -> dict[PairWithTimeframe, DataFrame]:
+        if not symbols_to_fetch:
+            return {}
         since_ms = (
             int(
                 timeframe_to_prev_date(
@@ -375,7 +479,7 @@ class PercentChangePairList(IPairList):
         needed_pairs: ListPairsWithTimeframes = [
             (p, self._lookback_timeframe, self._def_candletype)
             for p in [s["symbol"] for s in filtered_tickers]
-            if p not in self._pair_cache
+            if p in symbols_to_fetch
         ]
         candles = self._exchange.refresh_ohlcv_with_cache(needed_pairs, since_ms)
         return candles
@@ -383,18 +487,153 @@ class PercentChangePairList(IPairList):
     def fetch_percent_change_from_lookback_period(
         self, filtered_tickers: list[SymbolWithPercentage]
     ) -> list[SymbolWithPercentage]:
-        # get lookback period in ms, for exchange ohlcv fetch
-        candles = self.fetch_candles_for_lookback_period(filtered_tickers)
+        today = dt_now().date()
+        cache_updated = False
+        cached_symbols: set[str] = set()
+        symbols_to_fetch: set[str] = set()
+
+        if self._use_candle_any_match:
+            self._load_lookback_cache(today)
+            now_dt = dt_now()
+            refresh_delta = timedelta(seconds=self._refresh_period)
+
+            for entry in filtered_tickers:
+                symbol = entry["symbol"]
+                disk_entry = self._lookback_cache_data.get(symbol)
+                if self._is_cache_entry_fresh(disk_entry, refresh_delta, now_dt):
+                    selected_pct, ordered_values = self._evaluate_cached_percentages(disk_entry)
+                    disk_entry["percentage"] = selected_pct
+                    if not disk_entry.get("cached_at"):
+                        disk_entry["cached_at"] = now_dt.isoformat()
+                    entry["percentage"] = selected_pct
+                    self._percentage_cache[symbol] = disk_entry
+                    cached_symbols.add(symbol)
+                    if selected_pct is not None:
+                        logger.info(
+                            "PercentChangePairList: using cached percentage %.3f for %s.",
+                            selected_pct,
+                            symbol,
+                        )
+                    else:
+                        self._log_no_candle_match(symbol, ordered_values)
+                else:
+                    symbols_to_fetch.add(symbol)
+
+            if cached_symbols:
+                logger.info(
+                    "PercentChangePairList reused cached percentages for %d symbols; fetching %d symbols.",
+                    len(cached_symbols),
+                    len(filtered_tickers) - len(cached_symbols),
+                )
+        else:
+            symbols_to_fetch = {entry["symbol"] for entry in filtered_tickers}
+
+        candles = self.fetch_candles_for_lookback_period(filtered_tickers, symbols_to_fetch)
 
         for i, p in enumerate(filtered_tickers):
-            pair_candles = (
-                candles[(p["symbol"], self._lookback_timeframe, self._def_candletype)]
-                if (p["symbol"], self._lookback_timeframe, self._def_candletype) in candles
-                else None
-            )
+            symbol = p["symbol"]
+            if self._use_candle_any_match and symbol in cached_symbols:
+                continue
 
-            # in case of candle data calculate typical price and change for candle
-            if pair_candles is not None and not pair_candles.empty:
+            pair_candles = candles.get((symbol, self._lookback_timeframe, self._def_candletype))
+
+            if pair_candles is None or pair_candles.empty:
+                filtered_tickers[i]["percentage"] = None
+                self.log_once(
+                    f"Removed {symbol} from whitelist, because no candles were available.",
+                    logger.info,
+                )
+                continue
+
+            pair_candles = pair_candles.sort_values("date").reset_index(drop=True)
+            latest_date = pair_candles.iloc[-1]["date"]
+            latest_date_key = self._normalize_candle_timestamp(latest_date) or str(latest_date)
+
+            if self._use_candle_any_match:
+                cache_entry = self._percentage_cache.get(symbol)
+                disk_entry = self._lookback_cache_data.get(symbol)
+                chosen_entry = None
+                now_dt = dt_now()
+                refresh_delta = timedelta(seconds=self._refresh_period)
+
+                def _is_fresh(entry: dict[str, Any] | None) -> bool:
+                    if not entry:
+                        return False
+                    cached_at = entry.get("cached_at")
+                    if not cached_at:
+                        return False
+                    try:
+                        cached_dt = datetime.fromisoformat(cached_at)
+                    except ValueError:
+                        return False
+                    return now_dt - cached_dt <= refresh_delta
+
+                if (
+                    cache_entry
+                    and cache_entry.get("last_candle") == latest_date_key
+                    and _is_fresh(cache_entry)
+                    and cache_entry.get("percentages") is not None
+                ):
+                    chosen_entry = cache_entry
+                elif (
+                    disk_entry
+                    and disk_entry.get("last_candle") == latest_date_key
+                    and _is_fresh(disk_entry)
+                    and disk_entry.get("percentages") is not None
+                ):
+                    chosen_entry = disk_entry
+                    self._percentage_cache[symbol] = disk_entry
+
+                if chosen_entry is not None:
+                    selected_pct, ordered_values = self._evaluate_cached_percentages(chosen_entry)
+                    chosen_entry["percentage"] = selected_pct
+                    chosen_entry["cached_at"] = now_dt.isoformat()
+                    filtered_tickers[i]["percentage"] = selected_pct
+                    self._percentage_cache[symbol] = chosen_entry
+                    if chosen_entry is disk_entry:
+                        self._lookback_cache_data[symbol] = chosen_entry
+                        cache_updated = True
+
+                    if selected_pct is not None:
+                        logger.debug(
+                            "PercentChangePairList: using cached percentage %.3f for %s.",
+                            selected_pct,
+                            symbol,
+                        )
+                    else:
+                        self._log_no_candle_match(symbol, ordered_values)
+                    continue
+
+                dates, percentage_map = self._build_percentage_payload(pair_candles)
+                ordered_entries = [(d, percentage_map[d]) for d in dates if d in percentage_map]
+                selected_pct, all_values = self._select_percentage_from_entries(ordered_entries)
+                payload = {
+                    "percentage": selected_pct,
+                    "last_candle": latest_date_key,
+                    "percentages": percentage_map,
+                    "dates": dates,
+                    "cached_at": now_dt.isoformat(),
+                }
+                self._percentage_cache[symbol] = payload
+                self._lookback_cache_data[symbol] = payload
+                cache_updated = True
+                filtered_tickers[i]["percentage"] = selected_pct
+                if selected_pct is not None:
+                    logger.info(
+                        "PercentChangePairList: %s matched candle change %.3f%% (range %.3f%% to %.3f%%).",
+                        symbol,
+                        selected_pct,
+                        min(all_values) if all_values else 0.0,
+                        max(all_values) if all_values else 0.0,
+                    )
+                else:
+                    self._log_no_candle_match(symbol, all_values)
+            else:
+                cache_entry = self._percentage_cache.get(symbol)
+                if cache_entry and cache_entry.get("last_candle") == latest_date_key:
+                    filtered_tickers[i]["percentage"] = cache_entry.get("percentage")
+                    continue
+
                 current_close = pair_candles["close"].iloc[-1]
                 previous_close = pair_candles["close"].shift(self._lookback_period).iloc[-1]
                 pct_change = (
@@ -403,11 +642,90 @@ class PercentChangePairList(IPairList):
                     else 0
                 )
 
-                # replace change with a range change sum calculated above
                 filtered_tickers[i]["percentage"] = pct_change
-            else:
-                filtered_tickers[i]["percentage"] = 0
+                self._percentage_cache[symbol] = {
+                    "percentage": pct_change,
+                    "last_candle": latest_date_key,
+                }
+
+        if self._use_candle_any_match and cache_updated:
+            self._save_lookback_cache(today)
         return filtered_tickers
+
+    def _load_lookback_cache(self, today: date) -> None:
+        if self._lookback_cache_date == today and self._lookback_cache_data:
+            return
+        filename = (
+            self._lookback_cache_dir
+            / f"lookback_{self._lookback_timeframe}_{self._lookback_period}_{today.isoformat()}.json"
+        )
+        self._lookback_cache_file = filename
+        self._lookback_cache_date = today
+        data: dict[str, dict[str, Any]] = {}
+        if filename.exists():
+            try:
+                with filename.open("r", encoding="utf-8") as fp:
+                    raw = json.load(fp)
+                if isinstance(raw, dict):
+                    data = {}
+                    for key, value in raw.items():
+                        if not isinstance(value, dict):
+                            continue
+                        percentages_raw = value.get("percentages") or {}
+                        percentages: dict[str, float] = {}
+                        if isinstance(percentages_raw, dict):
+                            for p_key, p_val in percentages_raw.items():
+                                try:
+                                    percentages[str(p_key)] = float(p_val)
+                                except (TypeError, ValueError):
+                                    continue
+                        try:
+                            percentage_val = (
+                                float(value["percentage"])
+                                if "percentage" in value and value["percentage"] is not None
+                                else None
+                            )
+                        except (TypeError, ValueError):
+                            percentage_val = None
+                        entry = {
+                            "percentage": percentage_val,
+                            "last_candle": value.get("last_candle"),
+                            "percentages": percentages,
+                            "dates": value.get("dates", []),
+                            "cached_at": value.get("cached_at"),
+                        }
+                        data[str(key)] = entry
+                logger.info(
+                    "PercentChangePairList loaded %d cached lookback entries from %s.",
+                    len(data),
+                    filename,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "PercentChangePairList failed to load lookback cache %s: %s",
+                    filename,
+                    exc,
+                )
+                data = {}
+        self._lookback_cache_data = data
+
+    def _save_lookback_cache(self, today: date) -> None:
+        if not self._lookback_cache_file:
+            return
+        try:
+            with self._lookback_cache_file.open("w", encoding="utf-8") as fp:
+                json.dump(self._lookback_cache_data, fp, ensure_ascii=False, indent=2)
+            logger.info(
+                "PercentChangePairList persisted lookback cache with %d entries to %s.",
+                len(self._lookback_cache_data),
+                self._lookback_cache_file,
+            )
+        except Exception as exc:
+            logger.warning(
+                "PercentChangePairList failed to save lookback cache %s: %s",
+                self._lookback_cache_file,
+                exc,
+            )
 
     def fetch_percent_change_from_tickers(
         self, filtered_tickers: list[SymbolWithPercentage], tickers
@@ -466,7 +784,7 @@ class PercentChangePairList(IPairList):
                 if baseline_price > 0:
                     self._baseline_prices[pair] = baseline_price
                     updated = True
-                    logger.debug(
+                    logger.info(
                         "Baseline price for %s set to %.8f (date %s).",
                         pair,
                         baseline_price,
@@ -507,7 +825,7 @@ class PercentChangePairList(IPairList):
                     current_price = None
                 if current_price is not None:
                     pct = ((current_price - base_price) / base_price) * 100
-                    logger.debug(
+                    logger.info(
                         "Percent change for %s using baseline %.8f and current %.8f is %.3f%%.",
                         pair,
                         base_price,
@@ -531,6 +849,141 @@ class PercentChangePairList(IPairList):
             len([x for x in filtered_tickers if x["percentage"] is None]),
         )
         return filtered_tickers
+
+    def _calc_candle_percentage(self, candles: DataFrame, idx: int) -> float:
+        current_close = float(candles.iloc[idx]["close"])
+        pct = None
+        if idx > 0:
+            prev_close = float(candles.iloc[idx - 1]["close"])
+            if prev_close > 0:
+                pct = ((current_close - prev_close) / prev_close) * 100
+        if pct is None or not math.isfinite(pct):
+            open_price = float(candles.iloc[idx]["open"])
+            if open_price > 0:
+                pct = ((current_close - open_price) / open_price) * 100
+            else:
+                pct = 0.0
+        return pct
+
+    def _normalize_candle_timestamp(self, candle_ts: Any) -> str | None:
+        if isinstance(candle_ts, Timestamp):
+            ts = candle_ts
+        elif isinstance(candle_ts, datetime):
+            ts = Timestamp(candle_ts)
+        else:
+            try:
+                ts = to_datetime(candle_ts, utc=True)
+            except Exception:
+                return None
+            if not isinstance(ts, Timestamp):
+                return str(candle_ts)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return ts.isoformat()
+
+    def _percentage_matches(self, pct: float) -> bool:
+        if not math.isfinite(pct):
+            return False
+        if (
+            self._min_value is not None
+            and self._max_value is not None
+            and self._min_value > self._max_value
+        ):
+            return pct >= self._min_value or pct <= self._max_value
+        if self._min_value is not None and pct <= self._min_value:
+            return False
+        if self._max_value is not None and pct >= self._max_value:
+            return False
+        return True
+
+    def _is_cache_entry_fresh(
+        self, entry: dict[str, Any] | None, refresh_delta: timedelta, now_dt: datetime
+    ) -> bool:
+        if not entry:
+            return False
+        cached_at = entry.get("cached_at")
+        if not cached_at:
+            return False
+        try:
+            cached_dt = datetime.fromisoformat(cached_at)
+        except ValueError:
+            return False
+        return now_dt - cached_dt <= refresh_delta
+
+    def _build_percentage_payload(self, candles: DataFrame) -> tuple[list[str], dict[str, float]]:
+        total = len(candles.index)
+        if total == 0:
+            return [], {}
+        if self._lookback_period > 0:
+            start_idx = max(0, total - self._lookback_period)
+        else:
+            start_idx = 0
+
+        dates: list[str] = []
+        percentages: dict[str, float] = {}
+        for idx in range(start_idx, total):
+            iso_ts = self._normalize_candle_timestamp(candles.iloc[idx]["date"])
+            if iso_ts is None:
+                continue
+            pct = self._calc_candle_percentage(candles, idx)
+            percentages[iso_ts] = pct
+            dates.append(iso_ts)
+        return dates, percentages
+
+    def _select_percentage_from_entries(
+        self, entries: list[tuple[str, float]]
+    ) -> tuple[float | None, list[float]]:
+        values = [float(pct) for _, pct in entries if math.isfinite(pct)]
+        if not values:
+            return None, []
+        matches = [pct for pct in values if self._percentage_matches(pct)]
+        selected = matches[-1] if matches else None
+        return selected, values
+
+    def _evaluate_cached_percentages(
+        self, cache_entry: dict[str, Any]
+    ) -> tuple[float | None, list[float]]:
+        dates = cache_entry.get("dates") or []
+        percentages_map = cache_entry.get("percentages") or {}
+        if not isinstance(percentages_map, dict):
+            percentages_map = {}
+
+        ordered: list[tuple[str, float]] = []
+        if dates and isinstance(dates, list):
+            for key in dates:
+                try:
+                    val = float(percentages_map.get(key))
+                except (TypeError, ValueError):
+                    continue
+                ordered.append((key, val))
+        else:
+            for key, val in sorted(percentages_map.items()):
+                try:
+                    ordered.append((key, float(val)))
+                except (TypeError, ValueError):
+                    continue
+
+        if self._lookback_period > 0 and len(ordered) > self._lookback_period:
+            ordered = ordered[-self._lookback_period :]
+
+        selected, values = self._select_percentage_from_entries(ordered)
+        return selected, values
+
+    def _log_no_candle_match(self, symbol: str, values: list[float]) -> None:
+        if values:
+            self.log_once(
+                f"Removed {symbol} from whitelist, because no candle in the last "
+                f"{len(values)} {self._lookback_timeframe} periods matched the configured range. "
+                f"Observed range {min(values):.3f}% to {max(values):.3f}%.",
+                logger.info,
+            )
+        else:
+            self.log_once(
+                f"Removed {symbol} from whitelist, because candle data could not provide a valid percentage.",
+                logger.info,
+            )
 
     def _load_baseline_prices(self) -> None:
         today = dt_now().date()
