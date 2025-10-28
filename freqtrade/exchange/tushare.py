@@ -15,7 +15,6 @@ from typing import Any
 from pandas import DataFrame, concat, to_datetime
 from pandas.api.types import is_datetime64_any_dtype
 
-from freqtrade.data.history import get_datahandler
 from freqtrade.enums import CandleType, MarginMode, TradingMode
 from freqtrade.exceptions import OperationalException, PricingError, TemporaryError
 from freqtrade.exchange import Exchange
@@ -25,6 +24,10 @@ from freqtrade.exchange.exchange_utils import ROUND_DOWN, ROUND_UP
 from freqtrade.exchange.exchange_utils_timeframe import timeframe_to_msecs
 from freqtrade.util import dt_ts
 from zoneinfo import ZoneInfo
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from freqtrade.data.history import get_datahandler
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +197,8 @@ class Tushare(Exchange):
 
         self._datadir = Path(self._config.get("datadir", "user_data/data"))
         self._datadir.mkdir(parents=True, exist_ok=True)
+        from freqtrade.data.history import get_datahandler
+
         self._datahandler = get_datahandler(
             self._datadir, data_format=self._config.get("dataformat_ohlcv")
         )
