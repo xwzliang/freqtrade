@@ -51,6 +51,7 @@ class PercentChangePairList(IPairList):
         self._min_value = self._pairlistconfig.get("min_value", None)
         self._max_value = self._pairlistconfig.get("max_value", None)
         self._refresh_period = self._pairlistconfig.get("refresh_period", 1800)
+        self._minimum_refresh_period = 300  # 5 minutes
         self._pair_cache: TTLCache = TTLCache(maxsize=1, ttl=self._refresh_period)
         self._lookback_days = self._pairlistconfig.get("lookback_days", 0)
         self._lookback_timeframe = self._pairlistconfig.get("lookback_timeframe", "1d")
@@ -416,8 +417,36 @@ class PercentChangePairList(IPairList):
         self._persist_result(pairs)
         return pairs
 
+    def _force_refresh_latest_if_stale(
+        self,
+        key: PairWithTimeframe,
+        df: DataFrame | None,
+        expected_min_last_date: date,
+    ) -> DataFrame | None:
+        """
+        If df is None/empty or its last row's UTC date < expected_min_last_date,
+        force-refresh latest OHLCV with cache=False.
+        """
+        needs_refresh = False
+        if df is None or df.empty:
+            needs_refresh = True
+        else:
+            last_dt = df.iloc[-1]["date"]
+            try:
+                last_date = to_datetime(last_dt, utc=True).date()
+            except Exception:
+                last_date = None
+            if last_date is None or last_date < expected_min_last_date:
+                needs_refresh = True
+
+        if not needs_refresh:
+            return df
+
+        fresh = self._exchange.refresh_latest_ohlcv([key], cache=False).get(key)
+        return fresh if fresh is not None and not fresh.empty else df
+
     def _persist_result(self, pairs: list[str]) -> None:
-        payload = {"pairs": pairs, "refresh_period": self._refresh_period}
+        payload = {"pairs": pairs, "refresh_period": self._minimum_refresh_period}
         if self._save_to_file:
             try:
                 with self._save_to_file.open("w", encoding="utf-8") as fp:
@@ -452,7 +481,7 @@ class PercentChangePairList(IPairList):
                 existing_pairs.add(pair)
             merged_payload = {
                 "pairs": sorted(existing_pairs),
-                "refresh_period": self._refresh_period,
+                "refresh_period": self._minimum_refresh_period,
             }
             try:
                 with self._append_to_file.open("w", encoding="utf-8") as fp:
@@ -474,6 +503,7 @@ class PercentChangePairList(IPairList):
     ) -> dict[PairWithTimeframe, DataFrame]:
         if not symbols_to_fetch:
             return {}
+
         since_ms = (
             int(
                 timeframe_to_prev_date(
@@ -500,18 +530,56 @@ class PercentChangePairList(IPairList):
             f"till {format_ms_time(to_ms)}",
             logger.info,
         )
+
         needed_pairs: ListPairsWithTimeframes = [
             (p, self._lookback_timeframe, self._def_candletype)
             for p in [s["symbol"] for s in filtered_tickers]
             if p in symbols_to_fetch
         ]
         candles = self._exchange.refresh_ohlcv_with_cache(needed_pairs, since_ms)
+
+        # 👇 New: ensure latest completed candle is present (esp. for 1d at UTC rollover)
+        if self._lookback_timeframe == "1d":
+            expected_min_last_date = dt_now().date() - timedelta(days=1)
+            for key in needed_pairs:
+                df = candles.get(key)
+                df = self._force_refresh_latest_if_stale(key, df, expected_min_last_date)
+                if df is not None:
+                    candles[key] = df
+        else:
+            # Generic safeguard for non-1d TFs
+            expected_min_last_date = to_datetime(
+                timeframe_to_prev_date(
+                    self._lookback_timeframe, dt_now() - timedelta(minutes=self._tf_in_min)
+                ),
+                utc=True,
+            ).date()
+            for key in needed_pairs:
+                df = candles.get(key)
+                df = self._force_refresh_latest_if_stale(key, df, expected_min_last_date)
+                if df is not None:
+                    candles[key] = df
+
         return candles
 
     def fetch_percent_change_from_lookback_period(
         self, filtered_tickers: list[SymbolWithPercentage]
     ) -> list[SymbolWithPercentage]:
         today = dt_now().date()
+
+        # For 1d, at 00:07 UTC on the 29th, the latest *completed* daily bar is the 28th.
+        # For other TFs, use the generic "one timeframe back" rule.
+        if self._lookback_timeframe == "1d":
+            expected_min_last_date = today - timedelta(days=1)
+        else:
+            # generic: last fully closed candle ends one TF ago
+            expected_min_last_date = to_datetime(
+                timeframe_to_prev_date(
+                    self._lookback_timeframe, dt_now() - timedelta(minutes=self._tf_in_min)
+                ),
+                utc=True,
+            ).date()
+
         cache_updated = False
         cached_symbols: set[str] = set()
         symbols_to_fetch: set[str] = set()
@@ -522,10 +590,26 @@ class PercentChangePairList(IPairList):
             now_dt = dt_now()
             refresh_delta = timedelta(seconds=self._refresh_period)
 
+            # also compute an ISO string for comparing cache last_candle quickly
+            expected_min_last_iso = (
+                f"{expected_min_last_date.isoformat()}T00:00:00+00:00"
+                if self._lookback_timeframe == "1d"
+                else None
+            )
+
             for entry in filtered_tickers:
                 symbol = entry["symbol"]
                 cache_entry = self._lookback_cache_data.get(symbol)
-                if self._is_cache_entry_fresh(cache_entry, refresh_delta, now_dt):
+                is_time_fresh = False
+                if cache_entry and expected_min_last_iso:
+                    last_candle = cache_entry.get("last_candle")
+                    # treat missing/older last_candle as stale
+                    is_time_fresh = (
+                        isinstance(last_candle, str) and last_candle >= expected_min_last_iso
+                    )
+
+                # "fresh" only if both: within refresh window AND covers latest completed bar
+                if self._is_cache_entry_fresh(cache_entry, refresh_delta, now_dt) and is_time_fresh:
                     selected_pct, ordered_values = self._evaluate_cached_percentages(cache_entry)
                     if self._lookback_period > 0 and len(ordered_values) < self._lookback_period:
                         symbols_to_fetch.add(symbol)
@@ -561,9 +645,7 @@ class PercentChangePairList(IPairList):
             if self._use_candle_any_match and symbol in cached_symbols:
                 continue
 
-            pair_candles = candles.get(
-                (symbol, self._lookback_timeframe, self._def_candletype)
-            )
+            pair_candles = candles.get((symbol, self._lookback_timeframe, self._def_candletype))
 
             if pair_candles is None or pair_candles.empty:
                 filtered_tickers[i]["percentage"] = None
@@ -948,7 +1030,9 @@ class PercentChangePairList(IPairList):
                 )
                 existing["percentages"] = merged_percentages
                 existing["dates"] = merged_dates
-                existing["last_candle"] = merged_dates[-1] if merged_dates else existing.get("last_candle")
+                existing["last_candle"] = (
+                    merged_dates[-1] if merged_dates else existing.get("last_candle")
+                )
                 existing["percentage"] = entry.get("percentage", existing.get("percentage"))
                 existing["cached_at"] = self._max_cached_at(
                     existing.get("cached_at"), entry.get("cached_at")
@@ -970,7 +1054,10 @@ class PercentChangePairList(IPairList):
         if not dates:
             dates = list(percentages.keys())
         unique_dates = sorted(dict.fromkeys(dates))
-        if self._lookback_cache_max_candles and len(unique_dates) > self._lookback_cache_max_candles:
+        if (
+            self._lookback_cache_max_candles
+            and len(unique_dates) > self._lookback_cache_max_candles
+        ):
             unique_dates = unique_dates[-self._lookback_cache_max_candles :]
         limited_percentages = {d: percentages.get(d) for d in unique_dates if d in percentages}
         return unique_dates, limited_percentages
