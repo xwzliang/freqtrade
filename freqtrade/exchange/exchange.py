@@ -277,6 +277,12 @@ class Exchange:
             exchange_conf.get("ccxt_async_config", {}), ccxt_async_config
         )
         self._api_async = self._init_ccxt(exchange_conf, False, ccxt_async_config)
+        # Kick off async load_time_difference in our event loop to avoid -1021 on first signed call
+        try:
+            if hasattr(self, "loop") and hasattr(self._api_async, "load_time_difference"):
+                self.loop.run_until_complete(self._api_async.load_time_difference())
+        except Exception as _e:
+            logger.warning("load_time_difference (async) failed during init: %s", _e)
         _has_watch_ohlcv = self.exchange_has("watchOHLCV") and self._ft_has["ws_enabled"]
         if (
             self._config["runmode"] in TRADE_MODES
@@ -405,6 +411,18 @@ class Exchange:
             raise OperationalException(f"Exchange {name} is not supported") from e
         except ccxt.BaseError as e:
             raise OperationalException(f"Initialization of ccxt failed. Reason: {e}") from e
+
+        # Ensure local/server time delta is computed for sync client
+        try:
+            if hasattr(api, "load_time_difference") and sync:
+                _res = api.load_time_difference()
+                # If some environments return a coroutine here (shouldn't for sync), don't await in this context
+                import inspect
+
+                if inspect.isawaitable(_res):
+                    pass
+        except Exception as _e:
+            logger.warning("load_time_difference (sync) failed during init: %s", _e)
 
         return api
 
