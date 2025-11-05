@@ -673,6 +673,9 @@ class PercentChangePairList(IPairList):
                 merged_entries = [
                     (d, merged_percentages[d]) for d in merged_dates if d in merged_percentages
                 ]
+                if self._lookback_period > 0 and len(merged_entries) > self._lookback_period:
+                    merged_entries = merged_entries[-self._lookback_period :]
+                    merged_dates = [d for d, _ in merged_entries]
                 selected_pct, all_values = self._select_percentage_from_entries(merged_entries)
 
                 updated_ts = dt_now().isoformat()
