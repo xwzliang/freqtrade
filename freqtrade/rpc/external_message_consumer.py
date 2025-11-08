@@ -79,6 +79,10 @@ class ExternalMessageConsumer:
         # as the websockets client expects bytes.
         self.message_size_limit = self._emc_config.get("message_size_limit", 8) << 20
 
+        self._missing_df_warning_threshold = self._emc_config.get(
+            "missing_df_warning_threshold", 50
+        )
+
         # Setting these explicitly as they probably shouldn't be changed by a user
         # Unless we somehow integrate this with the strategy to allow creating
         # callbacks for the messages
@@ -373,10 +377,14 @@ class ExternalMessageConsumer:
             # Set to None for all candles if we missed a full df's worth of candles
             n_missing = n_missing if n_missing < FULL_DATAFRAME_THRESHOLD else 1500
 
-            logger.warning(
+            missing_msg = (
                 f"Holes in data or no existing df, requesting {n_missing} candles "
                 f"for {key} from `{producer_name}`"
             )
+            if n_missing >= self._missing_df_warning_threshold:
+                logger.warning(missing_msg)
+            else:
+                logger.debug(missing_msg)
 
             self.send_producer_request(
                 producer_name, WSAnalyzedDFRequest(data={"limit": n_missing, "pair": pair})

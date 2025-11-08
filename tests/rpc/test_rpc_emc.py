@@ -160,6 +160,49 @@ def test_emc_handle_producer_message(patched_emc, caplog, ohlcv_history):
     assert log_has_re(r"Empty message .+", caplog)
 
 
+def test_emc_missing_warning_threshold(default_conf, caplog, mocker, ohlcv_history):
+    default_conf.update(
+        {
+            "external_message_consumer": {
+                "enabled": True,
+                "missing_df_warning_threshold": 5,
+                "producers": [
+                    {
+                        "name": "default",
+                        "host": "null",
+                        "port": 9891,
+                        "ws_token": _TEST_WS_TOKEN,
+                    }
+                ],
+            }
+        }
+    )
+    mocker.patch("freqtrade.rpc.external_message_consumer.ExternalMessageConsumer.start", MagicMock())
+    dp = DataProvider(default_conf, None, None, None)
+    emc = ExternalMessageConsumer(default_conf, dp)
+
+    caplog.set_level(logging.DEBUG)
+    mocker.patch.object(dp, "_add_external_df", return_value=(False, 2))
+
+    df_message = {
+        "type": "analyzed_df",
+        "data": {
+            "key": ("BTC/USDT", "5m", "spot"),
+            "df": ohlcv_history,
+            "la": datetime.now(UTC),
+        },
+    }
+    emc.handle_producer_message(default_conf["external_message_consumer"]["producers"][0], df_message)
+
+    warning_logs = [
+        rec for rec in caplog.records if rec.levelno == logging.WARNING and "Holes in data" in rec.message
+    ]
+    assert not warning_logs
+    assert any("Holes in data" in rec.message for rec in caplog.records)
+
+    emc.shutdown()
+
+
 async def test_emc_create_connection_success(default_conf, caplog, mocker):
     default_conf.update(
         {

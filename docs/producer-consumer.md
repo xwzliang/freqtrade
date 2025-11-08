@@ -54,6 +54,7 @@ Enable subscribing to an instance by adding the `external_message_consumer` sect
 | `initial_candle_limit` | Initial candles to expect from the Producer.<br>*Defaults to `1500`.*<br> **Datatype:** Integer - Number of candles.
 | `message_size_limit` | Size limit per message<br>*Defaults to `8`.*<br> **Datatype:** Integer - Megabytes.
 | `use_producer_ohlcv_data` | Skip the consumer's own OHLCV refresh and reuse the candle data contained in the producer's analyzed dataframes. This prevents additional downloads on the consumer.<br>*Defaults to `false`.*<br> **Datatype:** Boolean.
+| `missing_df_warning_threshold` | Only raise warnings for missing candles when the gap is at least this size. Smaller gaps are logged at debug level to avoid noise.<br>*Defaults to `50`.*<br> **Datatype:** Integer.
 
 Enabling `use_producer_ohlcv_data` means the consumer will no longer call the exchange for OHLCV updates. Make sure your strategies rely on the producer-provided dataframes (e.g. using `process_only_new_candles = False` and `dp.get_producer_df`) when turning this on.
 

@@ -1066,6 +1066,15 @@ CONF_SCHEMA = {
                     "type": "boolean",
                     "default": False,
                 },
+                "missing_df_warning_threshold": {
+                    "description": (
+                        "Only emit warnings for missing candles when at least this many candles are missing."
+                    ),
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1500,
+                    "default": 50,
+                },
             },
             "required": ["producers"],
         },
