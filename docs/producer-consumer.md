@@ -31,6 +31,7 @@ Enable subscribing to an instance by adding the `external_message_consumer` sect
         // "sleep_time": 10,
         // "remove_entry_exit_signals": false,
         // "message_size_limit": 8
+        // "use_producer_ohlcv_data": false
     }
     //...
 }
@@ -52,6 +53,9 @@ Enable subscribing to an instance by adding the `external_message_consumer` sect
 | `remove_entry_exit_signals` | Remove signal columns from the dataframe (set them to 0) on dataframe receipt.<br>*Defaults to `false`.*<br> **Datatype:** Boolean.
 | `initial_candle_limit` | Initial candles to expect from the Producer.<br>*Defaults to `1500`.*<br> **Datatype:** Integer - Number of candles.
 | `message_size_limit` | Size limit per message<br>*Defaults to `8`.*<br> **Datatype:** Integer - Megabytes.
+| `use_producer_ohlcv_data` | Skip the consumer's own OHLCV refresh and reuse the candle data contained in the producer's analyzed dataframes. This prevents additional downloads on the consumer.<br>*Defaults to `false`.*<br> **Datatype:** Boolean.
+
+Enabling `use_producer_ohlcv_data` means the consumer will no longer call the exchange for OHLCV updates. Make sure your strategies rely on the producer-provided dataframes (e.g. using `process_only_new_candles = False` and `dp.get_producer_df`) when turning this on.
 
 Instead of (or as well as) calculating indicators in `populate_indicators()` the follower instance listens on the connection to a producer instance's messages (or multiple producer instances in advanced configurations) and requests the producer's most recently analyzed dataframes for each pair in the active whitelist.
 

@@ -311,6 +311,52 @@ def test_refresh(mocker, default_conf):
     assert refresh_mock.call_count == 1
 
 
+def test_consumer_use_producer_ohlcv(mocker, default_conf, ohlcv_history):
+    default_conf["runmode"] = RunMode.DRY_RUN
+    default_conf["external_message_consumer"] = {
+        "enabled": True,
+        "use_producer_ohlcv_data": True,
+        "producers": [
+            {
+                "name": "leader",
+                "host": "127.0.0.1",
+                "port": 8080,
+                "ws_token": "token",
+            }
+        ],
+    }
+
+    exchange = get_patched_exchange(mocker, default_conf, exchange="binance")
+    dp = DataProvider(default_conf, exchange)
+
+    timeframe = default_conf["timeframe"]
+    candle_type = default_conf["candle_type_def"]
+    now = datetime.now(UTC)
+    dp._set_producer_pairs(["UNITTEST/BTC"], "leader")
+    dp._add_external_df(
+        "UNITTEST/BTC",
+        ohlcv_history,
+        now,
+        timeframe,
+        candle_type=candle_type,
+        producer_name="leader",
+    )
+
+    df = dp.ohlcv("UNITTEST/BTC", timeframe)
+    assert not df.empty
+    assert df.equals(ohlcv_history)
+
+    refresh_mock = mocker.patch.object(exchange, "refresh_latest_ohlcv")
+    dp.refresh([("UNITTEST/BTC", timeframe)])
+    refresh_mock.assert_not_called()
+
+    available = dp.available_pairs
+    assert ("UNITTEST/BTC", timeframe, candle_type) in available
+
+    missing = dp.ohlcv("UNKNOWN/BTC", timeframe)
+    assert missing.empty
+
+
 def test_orderbook(mocker, default_conf, order_book_l2):
     api_mock = MagicMock()
     api_mock.fetch_l2_order_book = order_book_l2
@@ -428,6 +474,7 @@ def test_get_analyzed_dataframe(mocker, default_conf, ohlcv_history):
 
 
 def test_no_exchange_mode(default_conf):
+    default_conf["runmode"] = RunMode.DRY_RUN
     dp = DataProvider(default_conf, None)
 
     message = "Exchange is not available to DataProvider."

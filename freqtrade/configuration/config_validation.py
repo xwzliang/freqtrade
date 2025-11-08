@@ -387,6 +387,10 @@ def _validate_freqai_backtest(conf: dict[str, Any]) -> None:
 
 def _validate_consumers(conf: dict[str, Any]) -> None:
     emc_conf = conf.get("external_message_consumer", {})
+    if emc_conf.get("use_producer_ohlcv_data", False) and not emc_conf.get("enabled", False):
+        raise ConfigurationError(
+            "`external_message_consumer.use_producer_ohlcv_data` requires the consumer to be enabled."
+        )
     if emc_conf.get("enabled", False):
         if len(emc_conf.get("producers", [])) < 1:
             raise ConfigurationError("You must specify at least 1 Producer to connect to.")

@@ -66,8 +66,28 @@ class DataProvider:
             maxsize=1000, ttl=timeframe_to_seconds(self._default_timeframe)
         )
 
-        self.producers = self._config.get("external_message_consumer", {}).get("producers", [])
+        emc_conf = self._config.get("external_message_consumer", {})
+        self.producers = emc_conf.get("producers", [])
         self.external_data_enabled = len(self.producers) > 0
+        producer_names: list[str] = []
+        for producer in self.producers:
+            name = producer.get("name", "default")
+            if name not in producer_names:
+                producer_names.append(name)
+        if not producer_names:
+            producer_names = ["default"]
+        elif "default" not in producer_names:
+            producer_names.append("default")
+        self._producer_name_preference = producer_names
+        self._use_producer_ohlcv_data = (
+            emc_conf.get("use_producer_ohlcv_data", False) and self.external_data_enabled
+        )
+        self._producer_ohlcv_skip_logged = False
+        if self.external_data_enabled:
+            if self._use_producer_ohlcv_data:
+                logger.info("Consumer configured to reuse OHLCV data from producer(s).")
+            else:
+                logger.info("Consumer will continue downloading OHLCV data from the exchange.")
 
     def _set_dataframe_max_index(self, pair: str, limit_index: int):
         """
@@ -116,6 +136,29 @@ class DataProvider:
         :returns: List of pairs
         """
         return self.__producer_pairs.get(producer_name, []).copy()
+
+    def _get_producer_df_from_names(
+        self,
+        pair: str,
+        timeframe: str,
+        candle_type: CandleType,
+        producer_names: list[str],
+        copy: bool = True,
+    ) -> tuple[DataFrame, datetime]:
+        pair_key = (pair, timeframe, candle_type)
+
+        for name in producer_names:
+            if name not in self.__producer_pairs_df:
+                continue
+
+            df_store = self.__producer_pairs_df[name]
+            if pair_key not in df_store:
+                continue
+
+            df, la = df_store[pair_key]
+            return (df.copy() if copy else df, la)
+
+        return (DataFrame(), datetime.fromtimestamp(0, tz=UTC))
 
     def _emit_df(self, pair_key: PairWithTimeframe, dataframe: DataFrame, new_candle: bool) -> None:
         """
@@ -258,6 +301,7 @@ class DataProvider:
         timeframe: str | None = None,
         candle_type: CandleType | None = None,
         producer_name: str = "default",
+        copy: bool = True,
     ) -> tuple[DataFrame, datetime]:
         """
         Get the pair data from producers.
@@ -265,26 +309,15 @@ class DataProvider:
         :param pair: pair to get the data for
         :param timeframe: Timeframe to get data for
         :param candle_type: Any of the enum CandleType (must match trading mode!)
+        :param copy: Return a copy of the dataframe (default). Set to False for read-only access.
         :returns: Tuple of the DataFrame and last analyzed timestamp
         """
         _timeframe = self._default_timeframe if not timeframe else timeframe
         _candle_type = self._default_candle_type if not candle_type else candle_type
 
-        pair_key = (pair, _timeframe, _candle_type)
-
-        # If we have no data from this Producer yet
-        if producer_name not in self.__producer_pairs_df:
-            # We don't have this data yet, return empty DataFrame and datetime (01-01-1970)
-            return (DataFrame(), datetime.fromtimestamp(0, tz=UTC))
-
-        # If we do have data from that Producer, but no data on this pair_key
-        if pair_key not in self.__producer_pairs_df[producer_name]:
-            # We don't have this data yet, return empty DataFrame and datetime (01-01-1970)
-            return (DataFrame(), datetime.fromtimestamp(0, tz=UTC))
-
-        # We have it, return this data
-        df, la = self.__producer_pairs_df[producer_name][pair_key]
-        return (df.copy(), la)
+        return self._get_producer_df_from_names(
+            pair, _timeframe, _candle_type, [producer_name], copy=copy
+        )
 
     def add_pairlisthandler(self, pairlists) -> None:
         """
@@ -447,7 +480,14 @@ class DataProvider:
             raise OperationalException(NO_EXCHANGE_EXCEPTION)
         final_pairs = (pairlist + helping_pairs) if helping_pairs else pairlist
         # refresh latest ohlcv data
-        self._exchange.refresh_latest_ohlcv(final_pairs)
+        if self._use_producer_ohlcv_data and self.runmode in (RunMode.DRY_RUN, RunMode.LIVE):
+            if not self._producer_ohlcv_skip_logged:
+                logger.info(
+                    "Skipping local OHLCV refresh – using producer supplied data instead."
+                )
+                self._producer_ohlcv_skip_logged = True
+        else:
+            self._exchange.refresh_latest_ohlcv(final_pairs)
         # refresh latest trades data
         self.refresh_latest_trades(pairlist)
 
@@ -467,6 +507,18 @@ class DataProvider:
         Return a list of tuples containing (pair, timeframe) for which data is currently cached.
         Should be whitelist + open trades.
         """
+        if self._use_producer_ohlcv_data and self.runmode in (RunMode.DRY_RUN, RunMode.LIVE):
+            pairs: list[PairWithTimeframe] = []
+            for producer_store in self.__producer_pairs_df.values():
+                pairs.extend(producer_store.keys())
+            # Preserve order but remove duplicates
+            seen: set[PairWithTimeframe] = set()
+            unique_pairs: list[PairWithTimeframe] = []
+            for pair_key in pairs:
+                if pair_key not in seen:
+                    seen.add(pair_key)
+                    unique_pairs.append(pair_key)
+            return unique_pairs
         if self._exchange is None:
             raise OperationalException(NO_EXCHANGE_EXCEPTION)
         return list(self._exchange._klines.keys())
@@ -483,17 +535,30 @@ class DataProvider:
         :param copy: copy dataframe before returning if True.
                      Use False only for read-only operations (where the dataframe is not modified)
         """
-        if self._exchange is None:
-            raise OperationalException(NO_EXCHANGE_EXCEPTION)
         if self.runmode in (RunMode.DRY_RUN, RunMode.LIVE):
+            _timeframe = timeframe or self._config["timeframe"]
             _candle_type = (
                 CandleType.from_string(candle_type)
                 if candle_type != ""
                 else self._config["candle_type_def"]
             )
-            return self._exchange.klines(
-                (pair, timeframe or self._config["timeframe"], _candle_type), copy=copy
-            )
+
+            if self._use_producer_ohlcv_data:
+                producer_names = [
+                    name for name, pairs in self.__producer_pairs.items() if pair in pairs
+                ]
+                if not producer_names:
+                    producer_names = self._producer_name_preference
+
+                df, _ = self._get_producer_df_from_names(
+                    pair, _timeframe, _candle_type, producer_names, copy=copy
+                )
+                return df
+
+            if self._exchange is None:
+                raise OperationalException(NO_EXCHANGE_EXCEPTION)
+
+            return self._exchange.klines((pair, _timeframe, _candle_type), copy=copy)
         else:
             return DataFrame()
 

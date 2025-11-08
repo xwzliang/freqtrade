@@ -1059,6 +1059,13 @@ CONF_SCHEMA = {
                     "maximum": 20,
                     "default": 8,
                 },
+                "use_producer_ohlcv_data": {
+                    "description": (
+                        "Use OHLCV data supplied by producers instead of downloading candles locally."
+                    ),
+                    "type": "boolean",
+                    "default": False,
+                },
             },
             "required": ["producers"],
         },
