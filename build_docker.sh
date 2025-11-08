@@ -1,1 +1,1 @@
-docker build -t xwzliang/freqtrade:0.0.3 .
+docker build -t xwzliang/freqtrade:0.0.4 .

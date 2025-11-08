@@ -1044,6 +1044,32 @@ class FreqtradeBot(LoggingMixin):
 
         self._notify_enter(trade, order_obj, order_type, sub_trade=pos_adjust)
 
+        immediate_stoploss = (
+            mode != "pos_adjust"
+            and order_status == "closed"
+            and self.strategy.order_types.get("stoploss_on_exchange")
+            and trade.is_open
+            and trade.has_open_position
+            and not trade.has_open_sl_orders
+        )
+        if immediate_stoploss:
+            if self.strategy.use_custom_stoploss:
+                current_rate = self.exchange.get_rate(
+                    trade.pair, side="exit", is_short=trade.is_short, refresh=True
+                )
+                profit = trade.calc_profit_ratio(current_rate)
+                after_fill_supported = getattr(self.strategy, "_ft_stop_uses_after_fill", False)
+                self.strategy.ft_stoploss_adjust(
+                    current_rate,
+                    trade,
+                    datetime.now(UTC),
+                    profit,
+                    0,
+                    after_fill=after_fill_supported,
+                )
+            self.handle_stoploss_on_exchange(trade)
+            Trade.commit()
+
         if pos_adjust:
             if order_status == "closed":
                 logger.info(f"DCA order closed, trade should be up to date: {trade}")
@@ -2375,8 +2401,14 @@ class FreqtradeBot(LoggingMixin):
                     trade.pair, side="exit", is_short=trade.is_short, refresh=True
                 )
                 profit = trade.calc_profit_ratio(current_rate)
+                after_fill_supported = getattr(self.strategy, "_ft_stop_uses_after_fill", False)
                 self.strategy.ft_stoploss_adjust(
-                    current_rate, trade, datetime.now(UTC), profit, 0, after_fill=True
+                    current_rate,
+                    trade,
+                    datetime.now(UTC),
+                    profit,
+                    0,
+                    after_fill=after_fill_supported,
                 )
             # Updating wallets when order is closed
             self.wallets.update()

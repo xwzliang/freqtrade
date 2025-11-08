@@ -59,6 +59,79 @@ def test_add_stoploss_on_exchange(mocker, default_conf_usdt, limit_order, is_sho
     assert trade.is_open is True
 
 
+def test_stoploss_on_exchange_immediate_after_entry(
+    mocker, default_conf_usdt, limit_order, fee
+) -> None:
+    patch_RPCManager(mocker)
+    patch_exchange(mocker)
+    enter_order = limit_order["buy"]
+    stoploss = MagicMock(return_value={"id": "sl_1"})
+    mocker.patch.multiple(
+        EXMS,
+        fetch_ticker=MagicMock(return_value={"bid": 1.9, "ask": 2.2, "last": 1.9}),
+        create_order=MagicMock(return_value=enter_order),
+        get_fee=fee,
+        create_stoploss=stoploss,
+        get_rate=MagicMock(return_value=2.0),
+    )
+
+    freqtrade = FreqtradeBot(default_conf_usdt)
+    patch_get_signal(freqtrade, enter_long=True, enter_short=False)
+
+    freqtrade.strategy.order_types["stoploss_on_exchange"] = True
+    freqtrade.strategy.use_custom_stoploss = True
+    freqtrade.strategy._ft_stop_uses_after_fill = False
+
+    def _custom_stoploss(*args, **kwargs):
+        return -0.04
+
+    freqtrade.strategy.custom_stoploss = _custom_stoploss
+
+    freqtrade.enter_positions()
+    trade = Trade.session.scalars(select(Trade)).first()
+
+    assert trade.has_open_sl_orders is True
+    stoploss.assert_called_once()
+    called_stop_price = stoploss.call_args[1]["stop_price"]
+    assert called_stop_price == pytest.approx(trade.stoploss_or_liquidation)
+
+
+def test_custom_stoploss_applied_on_fill_without_afterfill_support(
+    mocker, default_conf_usdt, limit_order, limit_order_open, fee
+) -> None:
+    patch_RPCManager(mocker)
+    patch_exchange(mocker)
+    stoploss = MagicMock(return_value={"id": "sl_recreated"})
+    mocker.patch.multiple(
+        EXMS,
+        fetch_ticker=MagicMock(return_value={"bid": 1.9, "ask": 2.2, "last": 1.9}),
+        create_order=MagicMock(return_value=limit_order_open["buy"]),
+        get_fee=fee,
+        create_stoploss=stoploss,
+        get_rate=MagicMock(return_value=2.0),
+        fetch_order=MagicMock(return_value=limit_order["buy"]),
+    )
+
+    freqtrade = FreqtradeBot(default_conf_usdt)
+    patch_get_signal(freqtrade, enter_long=True, enter_short=False)
+    freqtrade.strategy.order_types["stoploss_on_exchange"] = True
+    freqtrade.strategy.use_custom_stoploss = True
+    freqtrade.strategy._ft_stop_uses_after_fill = False
+
+    def _custom_stoploss(*args, **kwargs):
+        return -0.05
+
+    freqtrade.strategy.custom_stoploss = _custom_stoploss
+
+    freqtrade.enter_positions()
+    trade = Trade.session.scalars(select(Trade)).first()
+    assert trade.has_open_sl_orders is False
+
+    freqtrade.manage_open_orders()
+    trade = Trade.session.scalars(select(Trade)).first()
+    assert trade.stop_loss == pytest.approx(trade.open_rate * 0.95)
+
+
 @pytest.mark.parametrize("is_short", [False, True])
 def test_handle_stoploss_on_exchange(
     mocker, default_conf_usdt, fee, caplog, is_short, limit_order
