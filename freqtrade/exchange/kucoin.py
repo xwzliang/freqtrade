@@ -46,6 +46,7 @@ class Kucoin(Exchange):
         leverage: float,
         reduceOnly: bool = False,
         time_in_force: str = "GTC",
+        trigger_price: float | None = None,
     ) -> CcxtOrder:
         res = super().create_order(
             pair=pair,
@@ -56,6 +57,7 @@ class Kucoin(Exchange):
             leverage=leverage,
             reduceOnly=reduceOnly,
             time_in_force=time_in_force,
+            trigger_price=trigger_price,
         )
         # Kucoin returns only the order-id.
         # ccxt returns status = 'closed' at the moment - which is information ccxt invented.

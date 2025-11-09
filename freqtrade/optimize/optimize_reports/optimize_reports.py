@@ -633,6 +633,7 @@ def generate_strategy_stats(
         "trailing_stop_positive_offset": config.get("trailing_stop_positive_offset", 0.0),
         "trailing_only_offset_is_reached": config.get("trailing_only_offset_is_reached", False),
         "use_custom_stoploss": config.get("use_custom_stoploss", False),
+        "use_custom_conditional_orders": config.get("use_custom_conditional_orders", False),
         "minimal_roi": config["minimal_roi"],
         "use_exit_signal": config["use_exit_signal"],
         "exit_profit_only": config["exit_profit_only"],

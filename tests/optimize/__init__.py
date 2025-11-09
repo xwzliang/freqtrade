@@ -40,6 +40,7 @@ class BTContainer(NamedTuple):
     trailing_stop_positive_offset: float = 0.0
     use_exit_signal: bool = False
     use_custom_stoploss: bool = False
+    use_custom_conditional_orders: bool = False
     custom_entry_price: float | None = None
     custom_exit_price: float | None = None
     leverage: float = 1.0

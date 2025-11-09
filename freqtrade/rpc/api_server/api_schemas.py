@@ -246,6 +246,7 @@ class ShowConfig(BaseModel):
     unfilledtimeout: UnfilledTimeout | None = None  # Empty in webserver mode
     order_types: OrderTypes | None = None
     use_custom_stoploss: bool | None = None
+    use_custom_conditional_orders: bool | None = None
     timeframe: str | None = None
     timeframe_ms: int
     timeframe_min: int

@@ -12,6 +12,7 @@ Currently available callbacks:
 * [`custom_stake_amount()`](#stake-size-management)
 * [`custom_exit()`](#custom-exit-signal)
 * [`custom_stoploss()`](#custom-stoploss)
+* [`custom_conditional_orders()`](#custom-conditional-orders)
 * [`custom_roi()`](#custom-roi)
 * [`custom_entry_price()` and `custom_exit_price()`](#custom-order-price-rules)
 * [`check_entry_timeout()` and `check_exit_timeout()`](#custom-order-timeout-rules)
@@ -500,6 +501,42 @@ The helper function `stoploss_from_absolute()` can be used to convert from an ab
                                           leverage=trade.leverage)
 
     ```
+
+---
+
+## Custom conditional orders
+
+`custom_conditional_orders()` enables strategies to schedule trigger-based entry orders directly from Python logic. The callback must be enabled by setting `use_custom_conditional_orders = True` on the strategy class. When enabled, Freqtrade evaluates the callback for every tracked pair – even when no trade exists yet – and whenever a conditional order is already open for that pair.
+
+The callback must either return:
+
+* `None`, indicating that no conditional order should exist (Freqtrade cancels any outstanding conditional entry for that pair), or
+* a tuple containing the desired direction (`SignalDirection`, `"long"`, `"short"`, `"buy"` or `"sell"`) and the absolute trigger price at which the order should become active.
+
+Whenever the returned direction or trigger price differs from the currently open conditional order, Freqtrade cancels the existing order and places a new one with the requested trigger price. The bot persists these orders just like regular entries, so database exports, RPC output and notifications remain consistent.
+
+!!! info
+    Conditional orders rely on trigger/stop functionality exposed by the exchange through ccxt. By default the bot sends the trigger price using the `triggerPrice` parameter. If your exchange requires a different parameter name you can override `_ft_has_params` for the exchange in your configuration.
+
+```python
+from freqtrade.enums import SignalDirection
+
+class AwesomeStrategy(IStrategy):
+    use_custom_conditional_orders = True
+
+    def custom_conditional_orders(
+        self,
+        pair: str,
+        current_time: datetime,
+        current_rate: float,
+        candle: dict | None = None,
+        **kwargs,
+    ) -> tuple[SignalDirection | str, float] | None:
+        if self.should_wait_for_confirmation(pair):
+            return None
+        # Trigger a short entry 8% below the current price
+        return SignalDirection.SHORT, current_rate * 0.92
+```
 
 ---
 

@@ -1141,6 +1141,115 @@ def test_execute_entry_min_leverage(mocker, default_conf_usdt, fee, limit_order,
     # assert trade.stake_amount == 2
 
 
+def _setup_conditional_bot(mocker, default_conf_usdt):
+    freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
+    freqtrade.strategy.use_custom_conditional_orders = True
+    patch_get_signal(freqtrade, enter_long=False, enter_short=False)
+    return freqtrade
+
+
+@pytest.mark.usefixtures("init_persistence")
+def test_create_trade_conditional_order(mocker, default_conf_usdt) -> None:
+    freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
+    freqtrade.strategy.custom_conditional_orders = MagicMock(
+        return_value=(SignalDirection.SHORT, 90.0)
+    )
+    mocker.patch(f"{EXMS}.get_rate", MagicMock(return_value=100.0))
+    order = {
+        "id": "cond_1",
+        "status": "open",
+        "type": "conditional",
+        "side": "sell",
+        "amount": 1.0,
+        "filled": 0.0,
+        "remaining": 1.0,
+        "price": None,
+        "average": None,
+        "cost": 0.0,
+        "stopPrice": 90.0,
+    }
+    create_order_mock = mocker.patch(f"{EXMS}.create_order", MagicMock(return_value=order))
+
+    assert freqtrade.create_trade("ETH/USDT")
+    args = create_order_mock.call_args[1]
+    assert args["ordertype"] == "conditional"
+    assert args["trigger_price"] == 90.0
+    trade = Trade.get_open_trades()[0]
+    assert trade.enter_tag == "conditional_short"
+
+
+@pytest.mark.usefixtures("init_persistence")
+def test_manage_open_orders_updates_conditional_price(mocker, default_conf_usdt) -> None:
+    freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
+    freqtrade.strategy.custom_conditional_orders = MagicMock(
+        side_effect=[(SignalDirection.LONG, 90.0), (SignalDirection.LONG, 80.0)]
+    )
+    mocker.patch(f"{EXMS}.get_rate", MagicMock(return_value=100.0))
+    initial_order = {
+        "id": "cond_initial",
+        "status": "open",
+        "type": "conditional",
+        "side": "buy",
+        "amount": 1.0,
+        "filled": 0.0,
+        "remaining": 1.0,
+        "price": None,
+        "average": None,
+        "cost": 0.0,
+        "stopPrice": 90.0,
+    }
+    replacement_order = {
+        **initial_order,
+        "id": "cond_replace",
+        "stopPrice": 80.0,
+    }
+    create_order_mock = mocker.patch(
+        f"{EXMS}.create_order",
+        MagicMock(side_effect=[initial_order, replacement_order]),
+    )
+    mocker.patch(f"{EXMS}.cancel_order_with_result", MagicMock(return_value={**initial_order, "status": "canceled"}))
+    mocker.patch(f"{EXMS}.fetch_order", MagicMock(return_value=initial_order))
+
+    assert freqtrade.create_trade("ETH/USDT")
+    freqtrade.manage_open_orders()
+    assert create_order_mock.call_count == 2
+    args = create_order_mock.call_args_list[-1][1]
+    assert args["trigger_price"] == 80.0
+
+
+@pytest.mark.usefixtures("init_persistence")
+def test_manage_open_orders_cancels_conditional_when_none(mocker, default_conf_usdt) -> None:
+    freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
+    freqtrade.strategy.custom_conditional_orders = MagicMock(
+        side_effect=[(SignalDirection.LONG, 90.0), None]
+    )
+    mocker.patch(f"{EXMS}.get_rate", MagicMock(return_value=100.0))
+    order = {
+        "id": "cond_cancel",
+        "status": "open",
+        "type": "conditional",
+        "side": "buy",
+        "amount": 1.0,
+        "filled": 0.0,
+        "remaining": 1.0,
+        "price": None,
+        "average": None,
+        "cost": 0.0,
+        "stopPrice": 90.0,
+    }
+    mocker.patch(f"{EXMS}.create_order", MagicMock(return_value=order))
+    mocker.patch(f"{EXMS}.fetch_order", MagicMock(return_value=order))
+    mocker.patch(
+        f"{EXMS}.cancel_order_with_result",
+        MagicMock(return_value={**order, "status": "canceled", "filled": 0.0}),
+    )
+
+    assert freqtrade.create_trade("ETH/USDT")
+    freqtrade.manage_open_orders()
+    assert Trade.get_open_trade_count() == 0
+
+
+
 @pytest.mark.parametrize(
     "return_value,side_effect,log_message",
     [

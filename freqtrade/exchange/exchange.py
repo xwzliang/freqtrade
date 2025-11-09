@@ -167,6 +167,10 @@ class Exchange:
         # Expected to be in the format {"fetchOHLCV": True} or {"fetchOHLCV": False}
         "ws_enabled": False,  # Set to true for exchanges with tested websocket support
         "has_delisting": False,  # Set to true for exchanges that have delisting pair checks
+        "conditional_orders": True,
+        "conditional_trigger_param": "triggerPrice",
+        "conditional_trigger_prop": "triggerPrice",
+        "conditional_underlying_type": "market",
     }
     _ft_has: FtHas = {}
     _ft_has_futures: FtHas = {}
@@ -1127,6 +1131,7 @@ class Exchange:
         params: dict | None = None,
         stop_loss: bool = False,
     ) -> CcxtOrder:
+        params = params.copy() if params else {}
         now = dt_now()
         order_id = f"dry_run_{side}_{pair}_{now.timestamp()}"
         # Rounding here must respect to contract sizes
@@ -1148,13 +1153,19 @@ class Exchange:
             "timestamp": dt_ts(now),
             "status": "open",
             "fee": None,
-            "info": {},
+            "info": params.copy(),
         }
         if stop_loss:
-            dry_order["info"] = {"stopPrice": dry_order["price"]}
+            dry_order["info"].update({"stopPrice": dry_order["price"]})
             dry_order[self._ft_has["stop_price_prop"]] = dry_order["price"]
             # Workaround to avoid filling stoploss orders immediately
             dry_order["ft_order_type"] = "stoploss"
+        if ordertype == "conditional":
+            trigger_param = self._ft_has.get("conditional_trigger_param", "triggerPrice")
+            trigger_value = params.get(trigger_param, rate)
+            dry_order["info"][trigger_param] = trigger_value
+            dry_order.setdefault(self._ft_has.get("conditional_trigger_prop", trigger_param), trigger_value)
+            dry_order.setdefault("stopPrice", trigger_value)
         orderbook: OrderBook | None = None
         if self.exchange_has("fetchL2OrderBook"):
             orderbook = self.fetch_l2_order_book(pair, 20)
@@ -1353,6 +1364,8 @@ class Exchange:
         return params
 
     def _order_needs_price(self, side: BuySell, ordertype: str) -> bool:
+        if ordertype == "conditional":
+            return False
         return (
             ordertype != "market"
             or (side == "buy" and self._api.options.get("createMarketBuyOrderRequiresPrice", False))
@@ -1370,27 +1383,73 @@ class Exchange:
         leverage: float,
         reduceOnly: bool = False,
         time_in_force: str = "GTC",
+        trigger_price: float | None = None,
     ) -> CcxtOrder:
+        conditional_order = ordertype == "conditional"
+        exchange_ordertype = (
+            self._ft_has.get("conditional_underlying_type", "market")
+            if conditional_order
+            else ordertype
+        )
+        trigger_price_normalized: float | None = None
+        trigger_param = self._ft_has.get("conditional_trigger_param", "triggerPrice")
+        trigger_prop = self._ft_has.get("conditional_trigger_prop", trigger_param)
+
         if self._config["dry_run"]:
+            dry_rate = rate
+            if conditional_order:
+                trigger_value = trigger_price if trigger_price is not None else rate
+                if trigger_value is None:
+                    raise InvalidOrderException("Conditional orders require a trigger price.")
+                trigger_price_normalized = self.price_to_precision(pair, trigger_value)
+                dry_rate = trigger_price_normalized
+            else:
+                dry_rate = self.price_to_precision(pair, rate) if rate is not None else 0.0
+
             dry_order = self.create_dry_run_order(
-                pair, ordertype, side, amount, self.price_to_precision(pair, rate), leverage
+                pair,
+                ordertype,
+                side,
+                amount,
+                dry_rate,
+                leverage,
+                params={trigger_param: trigger_price_normalized} if conditional_order else None,
             )
+            if conditional_order and trigger_price_normalized is not None:
+                dry_order.setdefault(trigger_prop, trigger_price_normalized)
+                dry_order.setdefault("stopPrice", trigger_price_normalized)
             return dry_order
 
-        params = self._get_params(side, ordertype, leverage, reduceOnly, time_in_force)
+        params = self._get_params(side, exchange_ordertype, leverage, reduceOnly, time_in_force)
+        if conditional_order:
+            trigger_value = trigger_price if trigger_price is not None else rate
+            if trigger_value is None:
+                raise InvalidOrderException("Conditional orders require a trigger price.")
+            trigger_price_normalized = self.price_to_precision(pair, trigger_value)
+            params[trigger_param] = trigger_price_normalized
 
         try:
             # Set the precision for amount and price(rate) as accepted by the exchange
             amount = self.amount_to_precision(pair, self._amount_to_contracts(pair, amount))
-            needs_price = self._order_needs_price(side, ordertype)
-            rate_for_order = self.price_to_precision(pair, rate) if needs_price else None
+            needs_price = self._order_needs_price(side, exchange_ordertype)
+            rate_for_order: float | None
+            if conditional_order and exchange_ordertype == "market":
+                rate_for_order = None
+            elif needs_price:
+                rate_for_order = (
+                    self.price_to_precision(pair, rate)
+                    if rate is not None
+                    else trigger_price_normalized
+                )
+            else:
+                rate_for_order = None
 
             if not reduceOnly:
                 self._lev_prep(pair, leverage, side)
 
             order = self._api.create_order(
                 pair,
-                ordertype,
+                exchange_ordertype,
                 side,
                 amount,
                 rate_for_order,
@@ -1400,8 +1459,12 @@ class Exchange:
                 # Map empty status to open.
                 order["status"] = "open"
 
-            if order.get("type") is None:
+            if order.get("type") is None or conditional_order:
                 order["type"] = ordertype
+
+            if conditional_order and trigger_price_normalized is not None:
+                order.setdefault(trigger_prop, trigger_price_normalized)
+                order.setdefault("stopPrice", trigger_price_normalized)
 
             self._log_exchange_response("create_order", order)
             order = self._order_contracts_to_amount(order)
@@ -1410,13 +1473,13 @@ class Exchange:
         except ccxt.InsufficientFunds as e:
             raise InsufficientFundsError(
                 f"Insufficient funds to create {ordertype} {side} order on market {pair}. "
-                f"Tried to {side} amount {amount} at rate {rate}."
+                f"Tried to {side} amount {amount} at rate {trigger_price_normalized or rate}."
                 f"Message: {e}"
             ) from e
         except ccxt.InvalidOrder as e:
             raise InvalidOrderException(
                 f"Could not create {ordertype} {side} order on market {pair}. "
-                f"Tried to {side} amount {amount} at rate {rate}. "
+                f"Tried to {side} amount {amount} at rate {trigger_price_normalized or rate}. "
                 f"Message: {e}"
             ) from e
         except ccxt.DDoSProtection as e:

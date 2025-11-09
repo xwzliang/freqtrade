@@ -212,7 +212,9 @@ class Order(ModelBase):
         self.average = safe_value_fallback(order, "average", default_value=self.average)
         self.remaining = safe_value_fallback(order, "remaining", default_value=self.remaining)
         self.cost = safe_value_fallback(order, "cost", default_value=self.cost)
-        self.stop_price = safe_value_fallback(order, "stopPrice", default_value=self.stop_price)
+        self.stop_price = safe_value_fallback(
+            order, "stopPrice", "triggerPrice", default_value=self.stop_price
+        )
         order_date = safe_value_fallback(order, "timestamp")
         if order_date:
             self.order_date = dt_from_ts(order_date)

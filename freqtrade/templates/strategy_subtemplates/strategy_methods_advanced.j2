@@ -198,6 +198,29 @@ def custom_stoploss(
     :return float: New stoploss value, relative to the current_rate
     """
 
+use_custom_conditional_orders = False
+
+def custom_conditional_orders(
+    self,
+    pair: str,
+    current_time: datetime,
+    current_rate: float,
+    candle: dict | None = None,
+    **kwargs,
+) -> tuple[str, float] | None:
+    """
+    Custom conditional order logic, returning a tuple containing direction and trigger price.
+    Returning None removes the currently scheduled conditional order for the pair.
+
+    :param pair: Pair that's currently analyzed
+    :param current_time: datetime object, containing the current datetime
+    :param current_rate: Rate, calculated based on pricing settings in entry_pricing.
+    :param candle: The latest analyzed candle contents.
+    :param **kwargs: Ensure to keep this here so updates to this won't break your strategy.
+    :return tuple[str, float] | None: Direction and trigger price.
+    """
+    return None
+
 def custom_exit(
     self,
     pair: str,

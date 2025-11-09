@@ -83,6 +83,7 @@ class IStrategy(ABC, HyperStrategyMixin):
     trailing_stop_positive_offset: float = 0.0
     trailing_only_offset_is_reached = False
     use_custom_stoploss: bool = False
+    use_custom_conditional_orders: bool = False
 
     # Can this strategy go short?
     can_short: bool = False
@@ -468,6 +469,32 @@ class IStrategy(ABC, HyperStrategyMixin):
         :return float: New stoploss value, relative to the current_rate
         """
         return self.stoploss
+
+    def custom_conditional_orders(
+        self,
+        pair: str,
+        current_time: datetime,
+        current_rate: float,
+        candle: dict | None = None,
+        **kwargs,
+    ) -> tuple[SignalDirection | str, float] | None:
+        """
+        Return a tuple containing the direction and trigger price for a conditional entry order.
+        Only called when ``use_custom_conditional_orders`` is set to True.
+
+        Returning ``None`` indicates that no conditional order should exist for the pair at the
+        current candle. Returning a tuple with the same direction and trigger price as the already
+        open conditional order keeps the existing order in place.
+
+        :param pair: Pair that's currently analyzed.
+        :param current_time: datetime object, containing the current datetime.
+        :param current_rate: Current rate for the pair, following entry pricing settings.
+        :param candle: The latest analyzed candle (dict-like structure) if available.
+        :param **kwargs: Ensure to keep this here so updates to this won't break your strategy.
+        :return tuple[SignalDirection | str, float] | None: Direction (``long``/``short``) and the
+            trigger price that should activate the order.
+        """
+        return None
 
     def custom_roi(
         self,

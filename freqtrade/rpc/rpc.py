@@ -158,6 +158,7 @@ class RPC:
             "trailing_only_offset_is_reached": config.get("trailing_only_offset_is_reached"),
             "unfilledtimeout": config.get("unfilledtimeout"),
             "use_custom_stoploss": config.get("use_custom_stoploss"),
+            "use_custom_conditional_orders": config.get("use_custom_conditional_orders"),
             "order_types": config.get("order_types"),
             "bot_name": config.get("bot_name", "freqtrade"),
             "timeframe": config.get("timeframe"),

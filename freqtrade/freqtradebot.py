@@ -5,6 +5,7 @@ Freqtrade is the main module of this bot. It contains the class Freqtrade()
 import logging
 import traceback
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from math import isclose
 from threading import Lock
@@ -68,6 +69,12 @@ from freqtrade.wallets import Wallets
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ConditionalOrderInstruction:
+    direction: SignalDirection
+    trigger_price: float
 
 
 class FreqtradeBot(LoggingMixin):
@@ -650,6 +657,173 @@ class FreqtradeBot(LoggingMixin):
 
         return trades_created
 
+    def _normalize_conditional_instruction(
+        self, value: Any
+    ) -> ConditionalOrderInstruction | None:
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            logger.warning(
+                "custom_conditional_orders must return a tuple of (direction, trigger_price)."
+            )
+            return None
+        direction_raw, trigger_raw = value
+        direction: SignalDirection | None = None
+        if isinstance(direction_raw, SignalDirection):
+            direction = direction_raw
+        elif isinstance(direction_raw, str):
+            mapping = {
+                "long": SignalDirection.LONG,
+                "buy": SignalDirection.LONG,
+                "short": SignalDirection.SHORT,
+                "sell": SignalDirection.SHORT,
+            }
+            direction = mapping.get(direction_raw.lower())
+            if direction is None:
+                try:
+                    direction = SignalDirection[direction_raw.upper()]
+                except KeyError:
+                    direction = None
+        if direction is None:
+            logger.warning("custom_conditional_orders returned an invalid direction: %s", direction_raw)
+            return None
+        try:
+            trigger_price = float(trigger_raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "custom_conditional_orders returned an invalid trigger price for %s: %s",
+                direction_raw,
+                trigger_raw,
+            )
+            return None
+        if trigger_price <= 0:
+            logger.warning("custom_conditional_orders trigger price must be > 0.")
+            return None
+        return ConditionalOrderInstruction(direction=direction, trigger_price=trigger_price)
+
+    def _get_conditional_instruction(
+        self,
+        pair: str,
+        analyzed_df,
+        *,
+        refresh_price: bool = True,
+    ) -> ConditionalOrderInstruction | None:
+        if not self.strategy.use_custom_conditional_orders or analyzed_df is None:
+            return None
+        if len(analyzed_df) == 0:
+            return None
+        candle = analyzed_df.iloc[-1].to_dict()
+        current_time = candle.get("date", datetime.now(UTC))
+        current_rate = self.exchange.get_rate(
+            pair, side="entry", is_short=False, refresh=refresh_price
+        )
+        instruction = strategy_safe_wrapper(
+            self.strategy.custom_conditional_orders, default_retval=None, supress_error=True
+        )(
+            pair=pair,
+            current_time=current_time,
+            current_rate=current_rate,
+            candle=candle,
+        )
+        return self._normalize_conditional_instruction(instruction)
+
+    def _place_conditional_order(
+        self,
+        pair: str,
+        instruction: ConditionalOrderInstruction,
+        nowtime: datetime | None,
+    ) -> bool:
+        if self.get_free_open_trades() <= 0:
+            logger.debug("Max open trades reached, cannot place conditional order for %s.", pair)
+            return False
+        if self.strategy.is_pair_locked(pair, candle_date=nowtime, side=instruction.direction):
+            lock = PairLocks.get_pair_longest_lock(pair, nowtime, instruction.direction)
+            if lock:
+                logger.info(
+                    f"Pair {pair} {lock.side} is locked until "
+                    f"{lock.lock_end_time.strftime(constants.DATETIME_PRINT_FORMAT)} "
+                    f"due to {lock.reason}."
+                )
+            return False
+
+        stake_amount = self.wallets.get_trade_stake_amount(pair, self.config["max_open_trades"])
+        if not stake_amount:
+            logger.warning("No stake amount available for conditional order on %s.", pair)
+            return False
+
+        return self.execute_entry(
+            pair=pair,
+            stake_amount=stake_amount,
+            price=instruction.trigger_price,
+            is_short=instruction.direction == SignalDirection.SHORT,
+            ordertype="conditional",
+            enter_tag=f"conditional_{instruction.direction.value}",
+            trigger_price=instruction.trigger_price,
+        )
+
+    def _extract_order_trigger_price(self, order: CcxtOrder, order_obj: Order) -> float | None:
+        trigger_prop = self.exchange._ft_has.get("conditional_trigger_prop", "triggerPrice")
+        trigger_price = safe_value_fallback(order, "stopPrice", trigger_prop, order_obj.stop_price)
+        return trigger_price or order_obj.stop_price
+
+    def _manage_conditional_open_order(
+        self,
+        trade: Trade,
+        order_obj: Order,
+        order: CcxtOrder,
+        instruction: ConditionalOrderInstruction | None,
+        latest_candle_time: datetime | None,
+    ) -> None:
+        if instruction is None:
+            logger.debug("Cancelling conditional order for %s - strategy returned no instruction.", trade.pair)
+            self.handle_cancel_enter(
+                trade,
+                order,
+                order_obj,
+                constants.CANCEL_REASON["USER_CANCEL"],
+                replacing=False,
+            )
+            return
+
+        desired_short = instruction.direction == SignalDirection.SHORT
+        current_trigger = self._extract_order_trigger_price(order, order_obj)
+        if desired_short != trade.is_short:
+            logger.info(
+                "Conditional order direction for %s changed. Recreating order for %s.",
+                trade.pair,
+                instruction.direction.value,
+            )
+            cancelled = self.handle_cancel_enter(
+                trade,
+                order,
+                order_obj,
+                constants.CANCEL_REASON["REPLACE"],
+                replacing=False,
+            )
+            if cancelled:
+                Trade.commit()
+                self._place_conditional_order(trade.pair, instruction, latest_candle_time)
+            return
+
+        if current_trigger is None or not isclose(
+            current_trigger, instruction.trigger_price, rel_tol=1e-05
+        ):
+            logger.debug(
+                "Updating conditional order for %s from %s to %s.",
+                trade.pair,
+                current_trigger,
+                instruction.trigger_price,
+            )
+            self.handle_replace_order(
+                order,
+                order_obj,
+                trade,
+                instruction.trigger_price,
+                True,
+                constants.CANCEL_REASON["REPLACE"],
+                replacing=True,
+            )
+
     def create_trade(self, pair: str) -> bool:
         """
         Check the implemented trading strategy for entry signals.
@@ -673,6 +847,9 @@ class FreqtradeBot(LoggingMixin):
         # running get_signal on historical data fetched
         (signal, enter_tag) = self.strategy.get_entry_signal(
             pair, self.strategy.timeframe, analyzed_df
+        )
+        cond_instruction = self._get_conditional_instruction(
+            pair, analyzed_df, refresh_price=not signal
         )
 
         if signal:
@@ -707,6 +884,8 @@ class FreqtradeBot(LoggingMixin):
             return self.execute_entry(
                 pair, stake_amount, enter_tag=enter_tag, is_short=(signal == SignalDirection.SHORT)
             )
+        elif cond_instruction:
+            return self._place_conditional_order(pair, cond_instruction, nowtime)
         else:
             return False
 
@@ -872,6 +1051,7 @@ class FreqtradeBot(LoggingMixin):
         trade: Trade | None = None,
         mode: EntryExecuteMode = "initial",
         leverage_: float | None = None,
+        trigger_price: float | None = None,
     ) -> bool:
         """
         Executes an entry for the given pair
@@ -887,8 +1067,10 @@ class FreqtradeBot(LoggingMixin):
         trade_side: LongShort = "short" if is_short else "long"
         pos_adjust = trade is not None
 
+        order_type = ordertype or self.strategy.order_types["entry"]
+
         enter_limit_requested, stake_amount, leverage = self.get_valid_enter_price_and_stake(
-            pair, price, stake_amount, trade_side, enter_tag, trade, mode, leverage_
+            pair, price, stake_amount, trade_side, enter_tag, trade, mode, leverage_, order_type
         )
 
         if not stake_amount:
@@ -908,7 +1090,7 @@ class FreqtradeBot(LoggingMixin):
         )
         logger.info(msg)
         amount = (stake_amount / enter_limit_requested) * leverage
-        order_type = ordertype or self.strategy.order_types["entry"]
+        conditional_trigger = trigger_price if order_type == "conditional" else None
 
         if mode == "initial" and not strategy_safe_wrapper(
             self.strategy.confirm_trade_entry, default_retval=True
@@ -937,6 +1119,7 @@ class FreqtradeBot(LoggingMixin):
             reduceOnly=False,
             time_in_force=time_in_force,
             leverage=leverage,
+            trigger_price=conditional_trigger or (enter_limit_requested if order_type == "conditional" else None),
         )
         order_obj = Order.parse_from_ccxt_object(order, pair, side, amount, enter_limit_requested)
         order_obj.ft_order_tag = enter_tag
@@ -1114,11 +1297,14 @@ class FreqtradeBot(LoggingMixin):
         trade: Trade | None,
         mode: EntryExecuteMode,
         leverage_: float | None,
+        order_type: str | None = None,
     ) -> tuple[float, float, float]:
         """
         Validate and eventually adjust (within limits) limit, amount and leverage
         :return: Tuple with (price, amount, leverage)
         """
+
+        order_type = order_type or self.strategy.order_types["entry"]
 
         if price:
             enter_limit_requested = price
@@ -1127,7 +1313,7 @@ class FreqtradeBot(LoggingMixin):
             enter_limit_requested = self.exchange.get_rate(
                 pair, side="entry", is_short=(trade_side == "short"), refresh=True
             )
-        if mode != "replace":
+        if mode != "replace" and order_type != "conditional":
             # Don't call custom_entry_price in order-adjust scenario
             custom_entry_price = strategy_safe_wrapper(
                 self.strategy.custom_entry_price, default_retval=enter_limit_requested
@@ -1596,6 +1782,9 @@ class FreqtradeBot(LoggingMixin):
         :return: None
         """
         for trade in Trade.get_open_trades():
+            cond_df = None
+            cond_instruction: ConditionalOrderInstruction | None = None
+            cond_candle_time: datetime | None = None
             open_order: Order
             for open_order in trade.open_orders:
                 try:
@@ -1604,6 +1793,24 @@ class FreqtradeBot(LoggingMixin):
                 except ExchangeError:
                     logger.info(
                         "Cannot query order for %s due to %s", trade, traceback.format_exc()
+                    )
+                    continue
+
+                if (
+                    self.strategy.use_custom_conditional_orders
+                    and (open_order.order_type == "conditional" or order.get("type") == "conditional")
+                ):
+                    if cond_df is None:
+                        cond_df, _ = self.dataprovider.get_analyzed_dataframe(
+                            trade.pair, self.strategy.timeframe
+                        )
+                        cond_instruction = self._get_conditional_instruction(
+                            trade.pair, cond_df, refresh_price=False
+                        )
+                        if cond_df is not None and len(cond_df) > 0:
+                            cond_candle_time = cond_df.iloc[-1]["date"]
+                    self._manage_conditional_open_order(
+                        trade, open_order, order, cond_instruction, cond_candle_time
                     )
                     continue
 
@@ -1764,6 +1971,7 @@ class FreqtradeBot(LoggingMixin):
             # place new order only if new price is supplied
             try:
                 if is_entry:
+                    entry_ordertype = order_obj.order_type or None
                     succeeded = self.execute_entry(
                         pair=trade.pair,
                         stake_amount=(
@@ -1773,6 +1981,10 @@ class FreqtradeBot(LoggingMixin):
                         trade=trade,
                         is_short=trade.is_short,
                         mode="replace",
+                        ordertype=entry_ordertype,
+                        trigger_price=(
+                            new_order_price if entry_ordertype == "conditional" else None
+                        ),
                     )
                 else:
                     succeeded = self.execute_trade_exit(
