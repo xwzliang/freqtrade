@@ -766,6 +766,28 @@ class FreqtradeBot(LoggingMixin):
         trigger_price = safe_value_fallback(order, "stopPrice", trigger_prop, order_obj.stop_price)
         return trigger_price or order_obj.stop_price
 
+    def _is_conditional_entry_order(
+        self, trade: Trade, order_obj: Order, order: CcxtOrder
+    ) -> bool:
+        if order_obj.ft_order_side != trade.entry_side:
+            return False
+        trigger_prop = self.exchange._ft_has.get("conditional_trigger_prop", "triggerPrice")
+        info = order.get("info", {}) if isinstance(order, dict) else {}
+        has_trigger = (
+            order.get(trigger_prop) is not None
+            or info.get(trigger_prop) is not None
+            or order_obj.stop_price is not None
+        )
+        tag_conditional = (
+            isinstance(order_obj.ft_order_tag, str)
+            and order_obj.ft_order_tag.startswith("conditional_")
+        )
+        order_type_conditional = (
+            (order_obj.order_type or "").lower() == "conditional"
+            or (str(order.get("type", "")).lower() == "conditional")
+        )
+        return order_type_conditional or tag_conditional or has_trigger
+
     def _manage_conditional_open_order(
         self,
         trade: Trade,
@@ -1796,10 +1818,15 @@ class FreqtradeBot(LoggingMixin):
                     )
                     continue
 
-                if (
+                fully_cancelled = self.update_trade_state(trade, open_order.order_id, order)
+                not_closed = order["status"] == "open" or fully_cancelled
+
+                is_conditional = (
                     self.strategy.use_custom_conditional_orders
-                    and (open_order.order_type == "conditional" or order.get("type") == "conditional")
-                ):
+                    and order.get("status") == "open"
+                    and self._is_conditional_entry_order(trade, open_order, order)
+                )
+                if is_conditional:
                     if cond_df is None:
                         cond_df, _ = self.dataprovider.get_analyzed_dataframe(
                             trade.pair, self.strategy.timeframe
@@ -1813,9 +1840,6 @@ class FreqtradeBot(LoggingMixin):
                         trade, open_order, order, cond_instruction, cond_candle_time
                     )
                     continue
-
-                fully_cancelled = self.update_trade_state(trade, open_order.order_id, order)
-                not_closed = order["status"] == "open" or fully_cancelled
 
                 if not_closed:
                     if fully_cancelled or (
