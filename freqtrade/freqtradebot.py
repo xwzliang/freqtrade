@@ -710,6 +710,13 @@ class FreqtradeBot(LoggingMixin):
             return None
         return ConditionalOrderInstruction(direction=direction, trigger_price=trigger_price)
 
+    def _normalize_trigger_price_value(self, pair: str, price: float) -> float:
+        try:
+            normalized = self.exchange.price_to_precision(pair, price)
+            return float(normalized)
+        except Exception:
+            return price
+
     def _get_conditional_instruction(
         self,
         pair: str,
@@ -742,6 +749,10 @@ class FreqtradeBot(LoggingMixin):
             data_ready=True,
             candle_time=candle_time,
         )
+        if result.instruction:
+            result.instruction.trigger_price = self._normalize_trigger_price_value(
+                pair, result.instruction.trigger_price
+            )
         logger.debug(
             "Conditional instruction eval for %s: direction=%s trigger=%s data_ready=%s refresh=%s",
             pair,
@@ -914,9 +925,8 @@ class FreqtradeBot(LoggingMixin):
                 self._place_conditional_order(trade.pair, instruction, latest_candle_time)
             return
 
-        if current_trigger is None or not isclose(
-            current_trigger, instruction.trigger_price, rel_tol=1e-05
-        ):
+        tolerance = max(1e-8, instruction.trigger_price * 1e-5)
+        if current_trigger is None or abs(current_trigger - instruction.trigger_price) > tolerance:
             logger.debug(
                 "Updating conditional order for %s from %s to %s.",
                 trade.pair,
@@ -2094,6 +2104,14 @@ class FreqtradeBot(LoggingMixin):
             try:
                 if is_entry:
                     entry_ordertype = order_obj.order_type or None
+                    trigger_price = None
+                    if (
+                        order_obj.ft_order_tag
+                        and isinstance(order_obj.ft_order_tag, str)
+                        and order_obj.ft_order_tag.startswith("conditional_")
+                    ):
+                        entry_ordertype = "conditional"
+                        trigger_price = new_order_price
                     succeeded = self.execute_entry(
                         pair=trade.pair,
                         stake_amount=(
@@ -2104,9 +2122,7 @@ class FreqtradeBot(LoggingMixin):
                         is_short=trade.is_short,
                         mode="replace",
                         ordertype=entry_ordertype,
-                        trigger_price=(
-                            new_order_price if entry_ordertype == "conditional" else None
-                        ),
+                        trigger_price=trigger_price,
                     )
                 else:
                     succeeded = self.execute_trade_exit(
