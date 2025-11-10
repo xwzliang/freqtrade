@@ -1,6 +1,6 @@
 # pragma pylint: disable=missing-docstring, C0103
 from datetime import UTC, datetime, timedelta
-from types import FunctionType
+from types import FunctionType, SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -1887,6 +1887,16 @@ def test_get_trades_proxy(fee, use_db, is_short):
     assert len(Trade.get_trades_proxy(open_date=opendate)) == 3
 
     Trade.use_db = True
+
+
+def test_has_open_trade(mocker):
+    mock_trade = SimpleNamespace(trade_direction="long")
+    mocker.patch(
+        "freqtrade.persistence.trade_model.Trade.get_trades_proxy",
+        return_value=[mock_trade],
+    )
+    assert Trade.has_open_trade("ETH/USDT", "long")
+    assert not Trade.has_open_trade("ETH/USDT", "short")
 
 
 @pytest.mark.usefixtures("init_persistence")

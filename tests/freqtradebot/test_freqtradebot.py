@@ -5,6 +5,7 @@ import logging
 import time
 from copy import deepcopy
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, PropertyMock, patch
 
 import pytest
@@ -331,6 +332,26 @@ def test_create_trade(
     assert whitelist == default_conf_usdt["exchange"]["pair_whitelist"]
 
 
+def test_create_trade_hedge_mode_skips_same_side(default_conf_usdt, ticker_usdt, fee, mocker) -> None:
+    patch_RPCManager(mocker)
+    patch_exchange(mocker)
+    mocker.patch.multiple(
+        EXMS,
+        fetch_ticker=ticker_usdt,
+        get_fee=fee,
+    )
+
+    freqtrade = FreqtradeBot(default_conf_usdt)
+    freqtrade.exchange.hedge_mode = True
+    patch_get_signal(freqtrade)
+    has_open_trade = mocker.patch(
+        "freqtrade.persistence.trade_model.Trade.has_open_trade", return_value=True
+    )
+
+    assert not freqtrade.create_trade("ETH/USDT")
+    has_open_trade.assert_called_once_with("ETH/USDT", "long")
+
+
 def test_create_trade_no_stake_amount(default_conf_usdt, ticker_usdt, fee, mocker) -> None:
     patch_RPCManager(mocker)
     patch_exchange(mocker)
@@ -442,6 +463,24 @@ def test_enter_positions_no_pairs_left(
     else:
         assert n == 0
         assert log_has("Active pair whitelist is empty.", caplog)
+
+
+def test_enter_positions_hedge_mode_processes_pairs(default_conf_usdt, mocker) -> None:
+    patch_RPCManager(mocker)
+    patch_exchange(mocker)
+    freqtrade = FreqtradeBot(default_conf_usdt)
+    freqtrade.exchange.hedge_mode = True
+    current_pair = freqtrade.active_pair_whitelist[0]
+    mock_trade = SimpleNamespace(pair=current_pair)
+    mocker.patch(
+        "freqtrade.persistence.trade_model.Trade.get_open_trades",
+        return_value=[mock_trade],
+    )
+    create_trade_mock = mocker.patch.object(freqtrade, "create_trade", return_value=False)
+
+    freqtrade.enter_positions()
+
+    assert create_trade_mock.call_count == len(freqtrade.active_pair_whitelist)
 
 
 @pytest.mark.usefixtures("init_persistence")

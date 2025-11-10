@@ -558,7 +558,7 @@ class FreqtradeBot(LoggingMixin):
             else:
                 trade.exit_reason = prev_exit_reason
                 total = (
-                    self.wallets.get_owned(trade.pair, trade.base_currency)
+                    self.wallets.get_owned(trade.pair, trade.base_currency, trade.trade_direction)
                     if trade.base_currency
                     else 0
                 )
@@ -617,11 +617,12 @@ class FreqtradeBot(LoggingMixin):
         if not whitelist:
             self.log_once("Active pair whitelist is empty.", logger.info)
             return trades_created
-        # Remove pairs for currently opened trades from the whitelist
-        for trade in Trade.get_open_trades():
-            if trade.pair in whitelist:
-                whitelist.remove(trade.pair)
-                logger.debug("Ignoring %s in pair whitelist", trade.pair)
+        # Remove pairs for currently opened trades from the whitelist unless hedge mode allows both sides.
+        if not self.exchange.hedge_mode:
+            for trade in Trade.get_open_trades():
+                if trade.pair in whitelist:
+                    whitelist.remove(trade.pair)
+                    logger.debug("Ignoring %s in pair whitelist", trade.pair)
 
         if not whitelist:
             self.log_once(
@@ -875,6 +876,14 @@ class FreqtradeBot(LoggingMixin):
         )
 
         if signal:
+            trade_side: LongShort = "short" if signal == SignalDirection.SHORT else "long"
+            if self.exchange.hedge_mode and Trade.has_open_trade(pair, trade_side):
+                logger.debug(
+                    "Skipping %s %s entry because an open trade already exists for this side.",
+                    pair,
+                    trade_side,
+                )
+                return False
             if self.strategy.is_pair_locked(pair, candle_date=nowtime, side=signal):
                 lock = PairLocks.get_pair_longest_lock(pair, nowtime, signal)
                 if lock:

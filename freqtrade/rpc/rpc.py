@@ -831,9 +831,7 @@ class RPC:
                     "is_position": False,
                 }
             )
-        symbol: str
-        position: PositionWallet
-        for symbol, position in self._freqtrade.wallets.get_all_positions().items():
+        for (symbol, side), position in self._freqtrade.wallets.get_all_positions().items():
             total += position.collateral
             total_bot += position.collateral
 
@@ -847,7 +845,7 @@ class RPC:
                     "est_stake": position.collateral,
                     "est_stake_bot": position.collateral,
                     "stake": stake_currency,
-                    "side": position.side,
+                    "side": side,
                     "is_bot_managed": True,
                     "is_position": True,
                 }

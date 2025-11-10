@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Literal, NamedTuple
 
-from freqtrade.constants import UNLIMITED_STAKE_AMOUNT, Config, IntOrInf
+from freqtrade.constants import UNLIMITED_STAKE_AMOUNT, Config, IntOrInf, LongShort
 from freqtrade.enums import RunMode, TradingMode
 from freqtrade.exceptions import DependencyException
 from freqtrade.exchange import Exchange
@@ -39,7 +39,7 @@ class Wallets:
         self._is_backtest = is_backtest
         self._exchange = exchange
         self._wallets: dict[str, Wallet] = {}
-        self._positions: dict[str, PositionWallet] = {}
+        self._positions: dict[tuple[str, LongShort], PositionWallet] = {}
         self._start_cap: dict[str, float] = {}
 
         self._stake_currency = self._exchange.get_proxy_coin()
@@ -51,6 +51,14 @@ class Wallets:
 
         self._last_wallet_refresh: datetime | None = None
         self.update()
+
+    @staticmethod
+    def _position_key(pair: str, side: LongShort) -> tuple[str, LongShort]:
+        return (pair, side)
+
+    @staticmethod
+    def _normalize_position_side(raw_side: str | None) -> LongShort:
+        return "short" if (raw_side or "").lower() == "short" else "long"
 
     def get_free(self, currency: str) -> float:
         balance = self._wallets.get(currency)
@@ -85,15 +93,25 @@ class Wallets:
             )
         return self.get_total(self._stake_currency)
 
-    def get_owned(self, pair: str, base_currency: str) -> float:
+    def get_owned(self, pair: str, base_currency: str, side: LongShort | None = None) -> float:
         """
         Get currently owned value.
         Designed to work across both spot and futures.
         """
         if self._config.get("trading_mode", "spot") != TradingMode.FUTURES:
             return self.get_total(base_currency) or 0
-        if pos := self._positions.get(pair):
-            return pos.position
+        if side:
+            if pos := self._positions.get(self._position_key(pair, side)):
+                return pos.position
+            return 0
+        long_pos = self._positions.get(self._position_key(pair, "long"))
+        short_pos = self._positions.get(self._position_key(pair, "short"))
+        if long_pos and not short_pos:
+            return long_pos.position
+        if short_pos and not long_pos:
+            return short_pos.position
+        if long_pos and short_pos:
+            return long_pos.position - short_pos.position
         return 0
 
     def _update_dry(self) -> None:
@@ -105,7 +123,7 @@ class Wallets:
         """
         # Recreate _wallets to reset closed trade balances
         _wallets = {}
-        _positions = {}
+        _positions: dict[tuple[str, LongShort], PositionWallet] = {}
         open_trades = Trade.get_trades_proxy(is_open=True)
         if not self._is_backtest:
             # Live / Dry-run mode
@@ -138,7 +156,8 @@ class Wallets:
                 )
         else:
             for position in open_trades:
-                _positions[position.pair] = PositionWallet(
+                key = self._position_key(position.pair, position.trade_direction)
+                _positions[key] = PositionWallet(
                     position.pair,
                     position=position.amount,
                     leverage=position.leverage,
@@ -190,7 +209,7 @@ class Wallets:
                 )
 
         positions = self._exchange.fetch_positions()
-        _parsed_positions = {}
+        _parsed_positions: dict[tuple[str, LongShort], PositionWallet] = {}
         for position in positions:
             symbol = position["symbol"]
             if position["side"] is None or position["collateral"] == 0.0:
@@ -199,12 +218,14 @@ class Wallets:
             size = self._exchange._contracts_to_amount(symbol, position["contracts"])
             collateral = safe_value_fallback(position, "initialMargin", "collateral", 0.0)
             leverage = position.get("leverage")
-            _parsed_positions[symbol] = PositionWallet(
+            side = self._normalize_position_side(position.get("side"))
+            key = self._position_key(symbol, side)
+            _parsed_positions[key] = PositionWallet(
                 symbol,
                 position=size,
                 leverage=leverage,
                 collateral=collateral,
-                side=position["side"],
+                side=side,
             )
         self._positions = _parsed_positions
         self._wallets = _wallets
@@ -233,7 +254,7 @@ class Wallets:
     def get_all_balances(self) -> dict[str, Wallet]:
         return self._wallets
 
-    def get_all_positions(self) -> dict[str, PositionWallet]:
+    def get_all_positions(self) -> dict[tuple[str, LongShort], PositionWallet]:
         return self._positions
 
     def _check_exit_amount(self, trade: Trade) -> bool:
@@ -242,7 +263,7 @@ class Wallets:
             wallet_amount: float = self.get_total(trade.safe_base_currency) * (2 - 0.981)
         else:
             # wallet_amount: float = self.wallets.get_free(trade.safe_base_currency)
-            position = self._positions.get(trade.pair)
+            position = self._positions.get(self._position_key(trade.pair, trade.trade_direction))
             if position is None:
                 # We don't own anything :O
                 return False

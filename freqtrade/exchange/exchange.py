@@ -215,6 +215,8 @@ class Exchange:
             if config.get("margin_mode")
             else self._supported_trading_mode_margin_pairs[0][1]
         )
+        # Allows exchanges to signal if simultaneous long/short positions are supported.
+        self.hedge_mode: bool = False
         config["trading_mode"] = self.trading_mode
         config["margin_mode"] = self.margin_mode
         config["candle_type_def"] = CandleType.get_default(self.trading_mode)
@@ -1359,7 +1361,7 @@ class Exchange:
         params = self._params.copy()
         if time_in_force != "GTC" and ordertype != "market":
             params.update({"timeInForce": time_in_force.upper()})
-        if reduceOnly:
+        if reduceOnly and not (self.hedge_mode and self.trading_mode == TradingMode.FUTURES):
             params.update({"reduceOnly": True})
         return params
 
@@ -1597,7 +1599,8 @@ class Exchange:
                 side=side, ordertype=ordertype, stop_price=stop_price_norm
             )
             if self.trading_mode == TradingMode.FUTURES:
-                params["reduceOnly"] = True
+                if not self.hedge_mode:
+                    params["reduceOnly"] = True
                 if "stoploss_price_type" in order_types and "stop_price_type_field" in self._ft_has:
                     price_type = self._ft_has["stop_price_type_value_mapping"][
                         order_types.get("stoploss_price_type", PriceType.LAST)

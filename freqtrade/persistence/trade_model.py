@@ -1575,6 +1575,14 @@ class LocalTrade:
             return LocalTrade.bt_open_open_trade_count
 
     @staticmethod
+    def has_open_trade(pair: str, side: LongShort) -> bool:
+        """
+        Check if an open trade exists for the given pair and direction.
+        """
+        open_trades = Trade.get_trades_proxy(pair=pair, is_open=True)
+        return any(trade.trade_direction == side for trade in open_trades)
+
+    @staticmethod
     def stoploss_reinitialization(desired_stoploss: float):
         """
         Adjust initial Stoploss to desired stoploss for all open trades.

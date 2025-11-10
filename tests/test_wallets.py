@@ -338,7 +338,8 @@ def test_sync_wallet_futures_live(mocker, default_conf):
     assert len(freqtrade.wallets._positions) == 2
 
     assert "USDT" in freqtrade.wallets._wallets
-    assert "ETH/USDT:USDT" in freqtrade.wallets._positions
+    eth_short = ("ETH/USDT:USDT", "short")
+    assert eth_short in freqtrade.wallets._positions
     assert freqtrade.wallets._last_wallet_refresh is not None
     assert freqtrade.wallets.get_owned("ETH/USDT:USDT", "ETH") == 1000
     assert freqtrade.wallets.get_owned("SOL/USDT:USDT", "SOL") == 0
@@ -347,7 +348,7 @@ def test_sync_wallet_futures_live(mocker, default_conf):
     del mock_result[0]
     freqtrade.wallets.update()
     assert len(freqtrade.wallets._positions) == 1
-    assert "ETH/USDT:USDT" not in freqtrade.wallets._positions
+    assert eth_short not in freqtrade.wallets._positions
 
 
 def test_sync_wallet_dry(mocker, default_conf_usdt, fee):
@@ -401,10 +402,10 @@ def test_sync_wallet_futures_dry(mocker, default_conf, fee):
     assert len(freqtrade.wallets._wallets) == 1
     assert len(freqtrade.wallets._positions) == 4
     positions = freqtrade.wallets.get_all_positions()
-    assert positions["ETH/BTC"].side == "short"
-    assert positions["ETC/BTC"].side == "long"
-    assert positions["XRP/BTC"].side == "long"
-    assert positions["LTC/BTC"].side == "short"
+    assert positions[("ETH/BTC", "short")].side == "short"
+    assert positions[("ETC/BTC", "long")].side == "long"
+    assert positions[("XRP/BTC", "long")].side == "long"
+    assert positions[("LTC/BTC", "short")].side == "short"
 
     assert (
         freqtrade.wallets.get_starting_balance()
@@ -595,8 +596,9 @@ def test_dry_run_wallet_initialization(mocker, default_conf_usdt, config, wallet
     else:
         # Futures mode
         assert "NEO" not in freqtrade.wallets._wallets
-        assert freqtrade.wallets._positions["NEO/USDT"].position == 45.04504504
-        assert pytest.approx(freqtrade.wallets._positions["NEO/USDT"].collateral) == 100
+        neo_long = ("NEO/USDT", "long")
+        assert freqtrade.wallets._positions[neo_long].position == 45.04504504
+        assert pytest.approx(freqtrade.wallets._positions[neo_long].collateral) == 100
 
         # Verify USDT wallet's free was reduced by trade amount
         assert (

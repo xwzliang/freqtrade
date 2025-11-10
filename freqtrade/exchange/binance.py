@@ -8,7 +8,7 @@ import ccxt
 from cachetools import TTLCache
 from pandas import DataFrame
 
-from freqtrade.constants import DEFAULT_DATAFRAME_COLUMNS
+from freqtrade.constants import DEFAULT_DATAFRAME_COLUMNS, BuySell
 from freqtrade.enums import TRADE_MODES, CandleType, MarginMode, PriceType, RunMode, TradingMode
 from freqtrade.exceptions import DDosProtection, OperationalException, TemporaryError
 from freqtrade.exchange import Exchange
@@ -119,22 +119,23 @@ class Binance(Exchange):
                 self._log_exchange_response("position_side_setting", position_side)
                 assets_margin = self._api.fapiPrivateGetMultiAssetsMargin()
                 self._log_exchange_response("multi_asset_margin", assets_margin)
-                msg = ""
-                if position_side.get("dualSidePosition") is True:
-                    msg += (
-                        "\nHedge Mode is not supported by freqtrade. "
-                        "Please change 'Position Mode' on your binance futures account."
-                    )
+                hedge_enabled = position_side.get("dualSidePosition") is True
+                self.hedge_mode = hedge_enabled
+                if hedge_enabled:
+                    logger.info("Binance futures hedge mode detected for this account.")
+                else:
+                    logger.info("Binance futures account uses one-way position mode.")
+                messages: list[str] = []
                 if (
                     assets_margin.get("multiAssetsMargin") is True
                     and self.margin_mode != MarginMode.CROSS
                 ):
-                    msg += (
+                    messages.append(
                         "\nMulti-Asset Mode is not supported by freqtrade. "
                         "Please change 'Asset Mode' on your binance futures account."
                     )
-                if msg:
-                    raise OperationalException(msg)
+                if messages:
+                    raise OperationalException("".join(messages))
         except ccxt.DDoSProtection as e:
             raise DDosProtection(e) from e
         except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
@@ -144,6 +145,36 @@ class Binance(Exchange):
 
         except ccxt.BaseError as e:
             raise OperationalException(e) from e
+
+    def _binance_position_side(self, side: BuySell, reduce_only: bool) -> str:
+        if reduce_only:
+            return "SHORT" if side == "buy" else "LONG"
+        return "SHORT" if side == "sell" else "LONG"
+
+    def _get_params(
+        self,
+        side: BuySell,
+        ordertype: str,
+        leverage: float,
+        reduceOnly: bool,
+        time_in_force: str = "GTC",
+    ) -> dict:
+        params = super()._get_params(
+            side=side,
+            ordertype=ordertype,
+            leverage=leverage,
+            reduceOnly=reduceOnly,
+            time_in_force=time_in_force,
+        )
+        if self.trading_mode == TradingMode.FUTURES and self.hedge_mode:
+            params["positionSide"] = self._binance_position_side(side, reduceOnly)
+        return params
+
+    def _get_stop_params(self, side: BuySell, ordertype: str, stop_price: float) -> dict:
+        params = super()._get_stop_params(side, ordertype, stop_price)
+        if self.trading_mode == TradingMode.FUTURES and self.hedge_mode:
+            params["positionSide"] = self._binance_position_side(side, True)
+        return params
 
     def get_historic_ohlcv(
         self,

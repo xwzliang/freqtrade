@@ -33,6 +33,16 @@ def test__get_params_binance(default_conf, mocker, side, order_type, time_in_for
     assert exchange._get_params(side, order_type, 1, False, time_in_force) == expected
 
 
+def test__get_params_binance_hedge_reduceonly(default_conf, mocker):
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    exchange = get_patched_exchange(mocker, default_conf, exchange="binance")
+    params = exchange._get_params("sell", "market", 1, True, "GTC")
+    assert params.get("reduceOnly") is True
+    exchange.hedge_mode = True
+    params = exchange._get_params("sell", "market", 1, True, "GTC")
+    assert "reduceOnly" not in params
+
+
 @pytest.mark.parametrize("trademode", [TradingMode.FUTURES, TradingMode.SPOT])
 @pytest.mark.parametrize(
     "limitratio,expected,side",
@@ -125,6 +135,30 @@ def test_create_stoploss_order_binance(default_conf, mocker, limitratio, expecte
         side=side,
         leverage=1.0,
     )
+
+
+def test_create_stoploss_order_binance_hedge_mode(default_conf, mocker):
+    api_mock = MagicMock()
+    order_id = f"test_prod_{randint(0, 10**6)}"
+    api_mock.create_order = MagicMock(return_value={"id": order_id, "info": {}})
+    default_conf["dry_run"] = False
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    mocker.patch(f"{EXMS}.amount_to_precision", lambda s, x, y: y)
+    mocker.patch(f"{EXMS}.price_to_precision", lambda s, x, y, **kwargs: y)
+    exchange = get_patched_exchange(mocker, default_conf, api_mock, "binance")
+    exchange.hedge_mode = True
+
+    exchange.create_stoploss(
+        pair="ETH/BTC",
+        amount=1,
+        stop_price=220,
+        order_types={"stoploss": "limit", "stoploss_price_type": "mark"},
+        side="sell",
+        leverage=1.0,
+    )
+    params = api_mock.create_order.call_args_list[0][1]["params"]
+    assert params == {"stopPrice": 220, "workingType": "MARK_PRICE"}
 
 
 def test_create_stoploss_order_dry_run_binance(default_conf, mocker):
@@ -687,14 +721,15 @@ def test_fill_leverage_tiers_binance_dryrun(default_conf, mocker, leverage_tiers
 def test_additional_exchange_init_binance(default_conf, mocker):
     api_mock = MagicMock()
     api_mock.fapiPrivateGetPositionSideDual = MagicMock(return_value={"dualSidePosition": True})
-    api_mock.fapiPrivateGetMultiAssetsMargin = MagicMock(return_value={"multiAssetsMargin": True})
+    api_mock.fapiPrivateGetMultiAssetsMargin = MagicMock(return_value={"multiAssetsMargin": False})
     default_conf["dry_run"] = False
     default_conf["trading_mode"] = TradingMode.FUTURES
     default_conf["margin_mode"] = MarginMode.ISOLATED
-    with pytest.raises(
-        OperationalException,
-        match=r"Hedge Mode is not supported.*\nMulti-Asset Mode is not supported.*",
-    ):
+    exchange = get_patched_exchange(mocker, default_conf, exchange="binance", api_mock=api_mock)
+    assert exchange.hedge_mode is True
+    api_mock.fapiPrivateGetPositionSideDual = MagicMock(return_value={"dualSidePosition": False})
+    api_mock.fapiPrivateGetMultiAssetsMargin = MagicMock(return_value={"multiAssetsMargin": True})
+    with pytest.raises(OperationalException, match=r"Multi-Asset Mode is not supported"):
         get_patched_exchange(mocker, default_conf, exchange="binance", api_mock=api_mock)
     api_mock.fapiPrivateGetPositionSideDual = MagicMock(return_value={"dualSidePosition": False})
     api_mock.fapiPrivateGetMultiAssetsMargin = MagicMock(return_value={"multiAssetsMargin": False})
