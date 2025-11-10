@@ -768,8 +768,10 @@ class FreqtradeBot(LoggingMixin):
         pair: str,
         instruction: ConditionalOrderInstruction,
         nowtime: datetime | None,
+        *,
+        allow_slot_override: bool = False,
     ) -> bool:
-        if self.get_free_open_trades() <= 0:
+        if not allow_slot_override and self.get_free_open_trades() <= 0:
             logger.debug("Max open trades reached, cannot place conditional order for %s.", pair)
             return False
         if self.strategy.is_pair_locked(pair, candle_date=nowtime, side=instruction.direction):
@@ -922,7 +924,12 @@ class FreqtradeBot(LoggingMixin):
             )
             if cancelled:
                 Trade.commit()
-                self._place_conditional_order(trade.pair, instruction, latest_candle_time)
+                self._place_conditional_order(
+                    trade.pair,
+                    instruction,
+                    latest_candle_time,
+                    allow_slot_override=True,
+                )
             return
 
         tolerance = max(1e-8, instruction.trigger_price * 1e-5)
@@ -983,6 +990,22 @@ class FreqtradeBot(LoggingMixin):
                 return True
         return False
 
+    def _can_bypass_conditional_slot_limit(
+        self, pair: str, instruction: ConditionalOrderInstruction
+    ) -> bool:
+        """
+        Allow conditional orders to be placed without free slots when hedging the opposite side.
+        """
+        if not self.exchange.hedge_mode:
+            return False
+        desired_side: LongShort = (
+            "short" if instruction.direction == SignalDirection.SHORT else "long"
+        )
+        opposite_side: LongShort = "long" if desired_side == "short" else "short"
+        if not Trade.has_open_trade(pair, opposite_side):
+            return False
+        return not Trade.has_open_trade(pair, desired_side)
+
     def create_trade(self, pair: str) -> bool:
         """
         Check the implemented trading strategy for entry signals.
@@ -996,12 +1019,7 @@ class FreqtradeBot(LoggingMixin):
 
         analyzed_df, _ = self.dataprovider.get_analyzed_dataframe(pair, self.strategy.timeframe)
         nowtime = analyzed_df.iloc[-1]["date"] if len(analyzed_df) > 0 else None
-
-        # get_free_open_trades is checked before create_trade is called
-        # but it is still used here to prevent opening too many trades within one iteration
-        if not self.get_free_open_trades():
-            logger.debug(f"Can't open a new trade for {pair}: max number of trades is reached.")
-            return False
+        free_open_trades = self.get_free_open_trades()
 
         # running get_signal on historical data fetched
         (signal, enter_tag) = self.strategy.get_entry_signal(
@@ -1014,6 +1032,9 @@ class FreqtradeBot(LoggingMixin):
 
         if signal:
             trade_side: LongShort = "short" if signal == SignalDirection.SHORT else "long"
+            if free_open_trades <= 0:
+                logger.debug(f"Can't open a new trade for {pair}: max number of trades is reached.")
+                return False
             if self.exchange.hedge_mode and Trade.has_open_trade(pair, trade_side):
                 logger.debug(
                     "Skipping %s %s entry because an open trade already exists for this side.",
@@ -1057,7 +1078,17 @@ class FreqtradeBot(LoggingMixin):
                 pair, cond_instruction, cond_result
             ):
                 return False
-            return self._place_conditional_order(pair, cond_instruction, nowtime)
+            allow_slot_override = False
+            if free_open_trades <= 0:
+                allow_slot_override = self._can_bypass_conditional_slot_limit(pair, cond_instruction)
+                if not allow_slot_override:
+                    logger.debug(
+                        "Max open trades reached, cannot place conditional order for %s.", pair
+                    )
+                    return False
+            return self._place_conditional_order(
+                pair, cond_instruction, nowtime, allow_slot_override=allow_slot_override
+            )
         else:
             return False
 

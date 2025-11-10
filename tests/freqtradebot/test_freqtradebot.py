@@ -1260,6 +1260,53 @@ def test_create_trade_conditional_order_updates_existing(mocker, default_conf_us
 
 
 @pytest.mark.usefixtures("init_persistence")
+def test_create_trade_conditional_order_opposite_side_bypasses_limit(
+    mocker, default_conf_usdt
+) -> None:
+    default_conf_usdt["max_open_trades"] = 1
+    freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
+    freqtrade.exchange.hedge_mode = True
+    freqtrade.strategy.custom_conditional_orders = MagicMock(
+        return_value=(SignalDirection.SHORT, 90.0)
+    )
+    mocker.patch(f"{EXMS}.get_rate", MagicMock(return_value=100.0))
+    order = {
+        "id": "cond_new",
+        "status": "open",
+        "type": "conditional",
+        "side": "sell",
+        "amount": 1.0,
+        "filled": 0.0,
+        "remaining": 1.0,
+        "price": None,
+        "average": None,
+        "cost": 0.0,
+        "stopPrice": 90.0,
+    }
+    create_order_mock = mocker.patch(f"{EXMS}.create_order", MagicMock(return_value=order))
+
+    Trade.session.add(
+        Trade(
+            pair="ETH/USDT",
+            stake_amount=10.0,
+            fee_open=0.0,
+            fee_close=0.0,
+            is_open=True,
+            amount=1.0,
+            open_rate=100.0,
+            exchange="binance",
+            open_date=dt_now(),
+            is_short=False,
+            leverage=1.0,
+        )
+    )
+    Trade.commit()
+
+    assert freqtrade.create_trade("ETH/USDT")
+    create_order_mock.assert_called_once()
+
+
+@pytest.mark.usefixtures("init_persistence")
 def test_manage_open_orders_updates_conditional_price(mocker, default_conf_usdt) -> None:
     freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
     freqtrade.strategy.custom_conditional_orders = MagicMock(
