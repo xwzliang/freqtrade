@@ -678,7 +678,7 @@ async def test_daily_handle(default_conf_usdt, update, ticker, fee, mocker, time
     # Move date to within day
     time_machine.move_to("2022-06-11 08:00:00+00:00")
     # Create some test data
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=_freqtradebot.strategy.get_strategy_name())
 
     # Try valid data
     # /daily 2
@@ -759,7 +759,7 @@ async def test_weekly_handle(default_conf_usdt, update, ticker, fee, mocker, tim
     telegram, freqtradebot, msg_mock = get_telegram_testobject(mocker, default_conf_usdt)
     # Move to saturday - so all trades are within that week
     time_machine.move_to("2022-06-11")
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=freqtradebot.strategy.get_strategy_name())
 
     # Try valid data
     # /weekly 2
@@ -830,7 +830,7 @@ async def test_monthly_handle(default_conf_usdt, update, ticker, fee, mocker, ti
     telegram, freqtradebot, msg_mock = get_telegram_testobject(mocker, default_conf_usdt)
     # Move to day within the month so all mock trades fall into this week.
     time_machine.move_to("2022-06-11")
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=freqtradebot.strategy.get_strategy_name())
 
     # Try valid data
     # /monthly 2
@@ -1014,7 +1014,7 @@ async def test_telegram_profit_long_short_handle(
     msg_mock.reset_mock()
 
     # When there are trades
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=_freqtradebot.strategy.get_strategy_name())
 
     # Keep only long trades
     for t in Trade.get_trades_proxy():
@@ -1719,7 +1719,7 @@ async def test_telegram_performance_handle(default_conf_usdt, update, ticker, fe
     telegram, _freqtradebot, msg_mock = get_telegram_testobject(mocker, default_conf_usdt)
 
     # Create some test data
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=_freqtradebot.strategy.get_strategy_name())
 
     await telegram._performance(update=update, context=MagicMock())
     assert msg_mock.call_count == 1
@@ -1738,7 +1738,7 @@ async def test_telegram_entry_tag_performance_handle(
     telegram, freqtradebot, msg_mock = get_telegram_testobject(mocker, default_conf_usdt)
     patch_get_signal(freqtradebot)
 
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=freqtradebot.strategy.get_strategy_name())
 
     context = MagicMock()
     await telegram._enter_tag_performance(update=update, context=context)
@@ -1771,7 +1771,7 @@ async def test_telegram_exit_reason_performance_handle(
     telegram, freqtradebot, msg_mock = get_telegram_testobject(mocker, default_conf_usdt)
     patch_get_signal(freqtradebot)
 
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=freqtradebot.strategy.get_strategy_name())
 
     context = MagicMock()
     await telegram._exit_reason_performance(update=update, context=context)
@@ -1805,7 +1805,7 @@ async def test_telegram_mix_tag_performance_handle(
     patch_get_signal(freqtradebot)
 
     # Create some test data
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=freqtradebot.strategy.get_strategy_name())
 
     context = MagicMock()
     await telegram._mix_tag_performance(update=update, context=context)
@@ -2948,7 +2948,7 @@ async def test_telegram_list_custom_data(default_conf_usdt, update, ticker, fee,
     telegram, _freqtradebot, msg_mock = get_telegram_testobject(mocker, default_conf_usdt)
 
     # Create some test data
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=_freqtradebot.strategy.get_strategy_name())
     # No trade id
     context = MagicMock()
     await telegram._list_custom_data(update=update, context=context)

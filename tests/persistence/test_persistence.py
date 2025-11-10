@@ -9,7 +9,7 @@ from freqtrade.constants import CUSTOM_TAG_MAX_LENGTH, DATETIME_PRINT_FORMAT
 from freqtrade.enums import TradingMode
 from freqtrade.exceptions import DependencyException
 from freqtrade.exchange.exchange_utils import TICK_SIZE
-from freqtrade.persistence import LocalTrade, Order, Trade, init_db
+from freqtrade.persistence import LocalTrade, Order, Trade, init_db, set_trade_strategy_filter
 from freqtrade.util import dt_now
 from tests.conftest import (
     create_mock_trades,
@@ -1887,6 +1887,22 @@ def test_get_trades_proxy(fee, use_db, is_short):
     assert len(Trade.get_trades_proxy(open_date=opendate)) == 3
 
     Trade.use_db = True
+
+
+@pytest.mark.usefixtures("init_persistence")
+def test_trade_strategy_filter(fee):
+    set_trade_strategy_filter(None)
+    create_mock_trades_usdt(fee, is_short=None)
+    all_trades = Trade.get_open_trades()
+    assert len(all_trades) > 0
+
+    set_trade_strategy_filter("SampleStrategy")
+    filtered = Trade.get_open_trades()
+    assert filtered
+    assert all(trade.strategy == "SampleStrategy" for trade in filtered)
+    assert len(filtered) <= len(all_trades)
+
+    set_trade_strategy_filter(None)
 
 
 def test_has_open_trade(mocker):

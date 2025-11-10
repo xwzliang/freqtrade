@@ -53,6 +53,24 @@ from freqtrade.util import FtPrecise, dt_from_ts, dt_now, dt_ts, dt_ts_none
 
 logger = logging.getLogger(__name__)
 
+_TRADE_STRATEGY_FILTER: str | None = None
+
+
+def set_trade_strategy_filter(strategy: str | None) -> None:
+    """
+    Configure the global strategy filter used to scope trades and orders.
+    """
+    global _TRADE_STRATEGY_FILTER
+    _TRADE_STRATEGY_FILTER = strategy
+
+
+def _resolve_strategy_filter(strategy: str | None = None) -> str | None:
+    """
+    Helper returning the explicit strategy parameter if provided,
+    otherwise falling back to the globally configured strategy filter.
+    """
+    return strategy if strategy is not None else _TRADE_STRATEGY_FILTER
+
 
 @dataclass
 class ProfitStruct:
@@ -423,7 +441,13 @@ class Order(ModelBase):
         Retrieve open orders from the database
         :return: List of open orders
         """
-        return Order.session.scalars(select(Order).filter(Order.ft_is_open.is_(True))).all()
+        strategy_filter = _resolve_strategy_filter()
+        stmt = select(Order).filter(Order.ft_is_open.is_(True))
+        if strategy_filter:
+            stmt = stmt.join(Trade, Order.ft_trade_id == Trade.id).filter(
+                Trade.strategy == strategy_filter
+            )
+        return Order.session.scalars(stmt).all()
 
     @staticmethod
     def order_by_id(order_id: str) -> Optional["Order"]:
@@ -1495,6 +1519,7 @@ class LocalTrade:
         is_open: bool | None = None,
         open_date: datetime | None = None,
         close_date: datetime | None = None,
+        strategy: str | None = None,
     ) -> list["LocalTrade"]:
         """
         Helper function to query Trades.
@@ -1521,6 +1546,8 @@ class LocalTrade:
             # Not used during backtesting, but might be used by a strategy
             sel_trades = list(LocalTrade.bt_trades + LocalTrade.bt_trades_open)
 
+        strategy_filter = _resolve_strategy_filter(strategy)
+
         if pair:
             sel_trades = [trade for trade in sel_trades if trade.pair == pair]
         if open_date:
@@ -1529,6 +1556,8 @@ class LocalTrade:
             sel_trades = [
                 trade for trade in sel_trades if trade.close_date and trade.close_date > close_date
             ]
+        if strategy_filter:
+            sel_trades = [trade for trade in sel_trades if trade.strategy == strategy_filter]
 
         return sel_trades
 
@@ -1556,22 +1585,32 @@ class LocalTrade:
         LocalTrade.bt_open_open_trade_count -= 1
 
     @staticmethod
-    def get_open_trades() -> list[Any]:
+    def get_open_trades(strategy: str | None = None) -> list[Any]:
         """
         Retrieve open trades
         """
-        return Trade.get_trades_proxy(is_open=True)
+        return Trade.get_trades_proxy(is_open=True, strategy=strategy)
 
     @staticmethod
-    def get_open_trade_count() -> int:
+    def get_open_trade_count(strategy: str | None = None) -> int:
         """
         get open trade count
         """
+        strategy_filter = _resolve_strategy_filter(strategy)
         if Trade.use_db:
-            return Trade.session.execute(
-                select(func.count(Trade.id)).filter(Trade.is_open.is_(True))
-            ).scalar_one()
+            stmt = select(func.count(Trade.id)).filter(Trade.is_open.is_(True))
+            if strategy_filter:
+                stmt = stmt.filter(Trade.strategy == strategy_filter)
+            return Trade.session.execute(stmt).scalar_one()
         else:
+            if strategy_filter:
+                return len(
+                    [
+                        t
+                        for t in LocalTrade.bt_trades_open
+                        if t.strategy == strategy_filter
+                    ]
+                )
             return LocalTrade.bt_open_open_trade_count
 
     @staticmethod
@@ -1838,6 +1877,7 @@ class Trade(ModelBase, LocalTrade):
         is_open: bool | None = None,
         open_date: datetime | None = None,
         close_date: datetime | None = None,
+        strategy: str | None = None,
     ) -> list["LocalTrade"]:
         """
         Helper function to query Trades.
@@ -1851,6 +1891,8 @@ class Trade(ModelBase, LocalTrade):
                            and will implicitly only return closed trades.
         :return: unsorted List[Trade]
         """
+        strategy_filter = _resolve_strategy_filter(strategy)
+
         if Trade.use_db:
             trade_filter = []
             if pair:
@@ -1861,10 +1903,16 @@ class Trade(ModelBase, LocalTrade):
                 trade_filter.append(Trade.close_date > close_date)
             if is_open is not None:
                 trade_filter.append(Trade.is_open.is_(is_open))
+            if strategy_filter:
+                trade_filter.append(Trade.strategy == strategy_filter)
             return cast(list[LocalTrade], Trade.get_trades(trade_filter).all())
         else:
             return LocalTrade.get_trades_proxy(
-                pair=pair, is_open=is_open, open_date=open_date, close_date=close_date
+                pair=pair,
+                is_open=is_open,
+                open_date=open_date,
+                close_date=close_date,
+                strategy=strategy_filter,
             )
 
     @staticmethod
@@ -1941,14 +1989,16 @@ class Trade(ModelBase, LocalTrade):
         """
         Retrieves total realized profit
         """
+        strategy_filter = _resolve_strategy_filter()
         if Trade.use_db:
-            total_profit = Trade.session.execute(
-                select(func.sum(Trade.close_profit_abs)).filter(Trade.is_open.is_(False))
-            ).scalar_one()
+            stmt = select(func.sum(Trade.close_profit_abs)).filter(Trade.is_open.is_(False))
+            if strategy_filter:
+                stmt = stmt.filter(Trade.strategy == strategy_filter)
+            total_profit = Trade.session.execute(stmt).scalar_one()
         else:
             total_profit = sum(
                 t.close_profit_abs  # type: ignore
-                for t in LocalTrade.get_trades_proxy(is_open=False)
+                for t in LocalTrade.get_trades_proxy(is_open=False, strategy=strategy_filter)
             )
         return total_profit or 0
 
@@ -1958,13 +2008,16 @@ class Trade(ModelBase, LocalTrade):
         Calculates total invested amount in open trades
         in stake currency
         """
+        strategy_filter = _resolve_strategy_filter()
         if Trade.use_db:
-            total_open_stake_amount = Trade.session.scalar(
-                select(func.sum(Trade.stake_amount)).filter(Trade.is_open.is_(True))
-            )
+            stmt = select(func.sum(Trade.stake_amount)).filter(Trade.is_open.is_(True))
+            if strategy_filter:
+                stmt = stmt.filter(Trade.strategy == strategy_filter)
+            total_open_stake_amount = Trade.session.scalar(stmt)
         else:
             total_open_stake_amount = sum(
-                t.stake_amount for t in LocalTrade.get_trades_proxy(is_open=True)
+                t.stake_amount
+                for t in LocalTrade.get_trades_proxy(is_open=True, strategy=strategy_filter)
             )
         return total_open_stake_amount or 0
 

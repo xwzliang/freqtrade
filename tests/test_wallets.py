@@ -358,7 +358,11 @@ def test_sync_wallet_dry(mocker, default_conf_usdt, fee):
     assert len(freqtrade.wallets._positions) == 0
     assert freqtrade.wallets.get_total("USDT") == 1000
 
-    create_mock_trades_usdt(fee, is_short=None)
+    create_mock_trades_usdt(
+        fee,
+        is_short=None,
+        strategy_name=freqtrade.strategy.get_strategy_name(),
+    )
 
     freqtrade.wallets.update()
 

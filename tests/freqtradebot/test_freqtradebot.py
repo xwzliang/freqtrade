@@ -4711,7 +4711,7 @@ def test_startup_update_open_orders(mocker, default_conf_usdt, fee, caplog, is_s
 @pytest.mark.usefixtures("init_persistence")
 def test_startup_backpopulate_precision(mocker, default_conf_usdt, fee, caplog):
     freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=freqtrade.strategy.get_strategy_name())
 
     trades = Trade.get_trades().all()
     trades[-1].exchange = "some_other_exchange"

@@ -46,7 +46,7 @@ from freqtrade.exchange.exchange_types import CcxtOrder
 from freqtrade.leverage.liquidation_price import update_liquidation_prices
 from freqtrade.misc import safe_value_fallback, safe_value_fallback2
 from freqtrade.mixins import LoggingMixin
-from freqtrade.persistence import Order, PairLocks, Trade, init_db
+from freqtrade.persistence import Order, PairLocks, Trade, init_db, set_trade_strategy_filter
 from freqtrade.persistence.key_value_store import set_startup_time
 from freqtrade.plugins.pairlistmanager import PairListManager
 from freqtrade.plugins.protectionmanager import ProtectionManager
@@ -105,6 +105,7 @@ class FreqtradeBot(LoggingMixin):
         )
 
         self.strategy: IStrategy = StrategyResolver.load_strategy(self.config)
+        set_trade_strategy_filter(self.strategy.get_strategy_name())
 
         # Check config consistency here since strategies can set certain options
         validate_config_consistency(config)

@@ -378,13 +378,17 @@ def patch_get_signal(
     freqtrade.exchange.refresh_latest_ohlcv = lambda p: None
 
 
-def create_mock_trades(fee, is_short: bool | None = False, use_db: bool = True):
+def create_mock_trades(
+    fee, is_short: bool | None = False, use_db: bool = True, strategy_name: str | None = None
+):
     """
     Create some fake trades ...
     :param is_short: Optional bool, None creates a mix of long and short trades.
     """
 
     def add_trade(trade):
+        if strategy_name:
+            trade.strategy = strategy_name
         if use_db:
             Trade.session.add(trade)
         else:
@@ -415,7 +419,9 @@ def create_mock_trades(fee, is_short: bool | None = False, use_db: bool = True):
         Trade.commit()
 
 
-def create_mock_trades_with_leverage(fee, use_db: bool = True):
+def create_mock_trades_with_leverage(
+    fee, use_db: bool = True, strategy_name: str | None = None
+):
     """
     Create some fake trades ...
     """
@@ -423,6 +429,8 @@ def create_mock_trades_with_leverage(fee, use_db: bool = True):
         Trade.session.rollback()
 
     def add_trade(trade):
+        if strategy_name:
+            trade.strategy = strategy_name
         if use_db:
             Trade.session.add(trade)
         else:
@@ -457,12 +465,19 @@ def create_mock_trades_with_leverage(fee, use_db: bool = True):
         Trade.session.flush()
 
 
-def create_mock_trades_usdt(fee, is_short: bool | None = False, use_db: bool = True):
+def create_mock_trades_usdt(
+    fee,
+    is_short: bool | None = False,
+    use_db: bool = True,
+    strategy_name: str | None = None,
+):
     """
     Create some fake trades ...
     """
 
     def add_trade(trade):
+        if strategy_name:
+            trade.strategy = strategy_name
         if use_db:
             Trade.session.add(trade)
         else:

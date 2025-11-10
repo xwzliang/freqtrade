@@ -827,7 +827,11 @@ def test_api_custom_data_single_trade(botclient, fee):
     Trade.reset_trades()
     CustomDataWrapper.reset_custom_data()
 
-    create_mock_trades_usdt(fee, use_db=True)
+    create_mock_trades_usdt(
+        fee,
+        use_db=True,
+        strategy_name=CURRENT_TEST_STRATEGY,
+    )
 
     trade1 = Trade.get_trades_proxy()[0]
 
@@ -915,7 +919,11 @@ def test_api_custom_data_multiple_open_trades(botclient, fee):
     trades = Trade.get_trades_proxy(is_open=True)
     assert len(trades) == 4
 
-    create_mock_trades_usdt(fee, use_db=True)
+    create_mock_trades_usdt(
+        fee,
+        use_db=True,
+        strategy_name=CURRENT_TEST_STRATEGY,
+    )
 
     trade1 = Trade.get_trades_proxy(is_open=True)[0]
     trade2 = Trade.get_trades_proxy(is_open=True)[1]
@@ -1365,7 +1373,11 @@ def test_api_profit_all(botclient, mocker, ticker, fee, markets):
     assert "short" in response
 
     assert response["all"]["trade_count"] == 0
-    create_mock_trades_usdt(fee, is_short=None)
+    create_mock_trades_usdt(
+        fee,
+        is_short=None,
+        strategy_name=ftbot.strategy.get_strategy_name(),
+    )
 
     rc = client_get(client, f"{BASE_URI}/profit_all")
     assert_response(rc, 200)
@@ -1415,7 +1427,10 @@ def test_api_performance(botclient, fee):
     ftbot, client = botclient
     patch_get_signal(ftbot)
 
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(
+        fee,
+        strategy_name=ftbot.strategy.get_strategy_name(),
+    )
 
     rc = client_get(client, f"{BASE_URI}/performance")
     assert_response(rc)

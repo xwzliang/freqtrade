@@ -324,7 +324,7 @@ def test__rpc_timeunit_profit(
     )
 
     freqtradebot = get_patched_freqtradebot(mocker, default_conf_usdt)
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=freqtradebot.strategy.get_strategy_name())
 
     stake_currency = default_conf_usdt["stake_currency"]
     fiat_display_currency = default_conf_usdt["fiat_display_currency"]
@@ -464,7 +464,7 @@ def test_rpc_trade_statistics(default_conf_usdt, ticker, fee, mocker) -> None:
     assert res["expectancy_ratio"] == 100
 
     # Create some test data
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=freqtradebot.strategy.get_strategy_name())
 
     stats = rpc._rpc_trade_statistics(stake_currency, fiat_display_currency)
     assert pytest.approx(stats["profit_closed_coin"]) == 2.74
@@ -987,7 +987,7 @@ def test_performance_handle(default_conf_usdt, ticker, fee, mocker) -> None:
     patch_get_signal(freqtradebot)
     rpc = RPC(freqtradebot)
     # Create some test data
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=freqtradebot.strategy.get_strategy_name())
 
     res = rpc._rpc_performance()
     assert len(res) == 3
@@ -1011,7 +1011,7 @@ def test_enter_tag_performance_handle(default_conf, ticker, fee, mocker) -> None
     rpc = RPC(freqtradebot)
 
     # Create some test data
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=freqtradebot.strategy.get_strategy_name())
     freqtradebot.enter_positions()
 
     res = rpc._rpc_enter_tag_performance(None)
@@ -1072,7 +1072,7 @@ def test_exit_reason_performance_handle(default_conf_usdt, ticker, fee, mocker) 
     rpc = RPC(freqtradebot)
 
     # Create some test data
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=freqtradebot.strategy.get_strategy_name())
 
     res = rpc._rpc_exit_reason_performance(None)
 
@@ -1128,7 +1128,7 @@ def test_mix_tag_performance_handle(default_conf, ticker, fee, mocker) -> None:
     rpc = RPC(freqtradebot)
 
     # Create some test data
-    create_mock_trades_usdt(fee)
+    create_mock_trades_usdt(fee, strategy_name=freqtradebot.strategy.get_strategy_name())
 
     res = rpc._rpc_mix_tag_performance(None)
 
