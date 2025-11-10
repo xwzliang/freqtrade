@@ -122,10 +122,9 @@ class MyAwesomeStrategy(IStrategy):
                 Categorical([True], name='trailing_stop'),
 
                 SKDecimal(0.01, 0.35, decimals=3, name='trailing_stop_positive'),
-                # 'trailing_stop_positive_offset' should be greater than 'trailing_stop_positive',
-                # so this intermediate parameter is used as the value of the difference between
-                # them. The value of the 'trailing_stop_positive_offset' is constructed in the
-                # generate_trailing_params() method.
+                # Use an intermediate parameter if you want `trailing_stop_positive_offset`
+                # to stay above `trailing_stop_positive`. The actual offset value is constructed
+                # in generate_trailing_params(), similar to the ROI table helper dimensions.
                 # This is similar to the hyperspace dimensions used for constructing the ROI tables.
                 SKDecimal(0.001, 0.1, decimals=3, name='trailing_stop_positive_offset_p1'),
 

@@ -177,7 +177,7 @@ The 0.02 would translate to a -2% stop loss.
 Before this, `stoploss` is used for the trailing stoploss.
 
 !!! Tip "Use an offset to change your stoploss"
-    Use `trailing_stop_positive_offset` to ensure that your new trailing stoploss will be in profit by setting `trailing_stop_positive_offset` higher than `trailing_stop_positive`. Your first new stoploss value will then already have locked in profits.
+    Use `trailing_stop_positive_offset` to control when the tighter trailing stop kicks in. Setting it higher than `trailing_stop_positive` locks in profit immediately, while keeping it equal or lower will activate the new trailing stop sooner (potentially before the trade is in profit).
 
     Example with simplified math:
 

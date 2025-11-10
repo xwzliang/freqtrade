@@ -143,12 +143,6 @@ def _validate_trailing_stoploss(conf: dict[str, Any]) -> None:
                 "The config trailing_only_offset_is_reached needs "
                 "trailing_stop_positive_offset to be more than 0 in your config."
             )
-    if tsl_positive > 0 and 0 < tsl_offset <= tsl_positive:
-        raise ConfigurationError(
-            "The config trailing_stop_positive_offset needs "
-            "to be greater than trailing_stop_positive in your config."
-        )
-
     # Fetch again without default
     if "trailing_stop_positive" in conf and float(conf["trailing_stop_positive"]) == 0.0:
         raise ConfigurationError(
