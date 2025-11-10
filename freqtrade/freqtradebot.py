@@ -77,6 +77,13 @@ class ConditionalOrderInstruction:
     trigger_price: float
 
 
+@dataclass
+class ConditionalInstructionResult:
+    instruction: ConditionalOrderInstruction | None
+    data_ready: bool = False
+    candle_time: datetime | None = None
+
+
 class FreqtradeBot(LoggingMixin):
     """
     Freqtrade is the main class of the bot.
@@ -709,13 +716,16 @@ class FreqtradeBot(LoggingMixin):
         analyzed_df,
         *,
         refresh_price: bool = True,
-    ) -> ConditionalOrderInstruction | None:
+    ) -> ConditionalInstructionResult:
         if not self.strategy.use_custom_conditional_orders or analyzed_df is None:
-            return None
-        if len(analyzed_df) == 0:
-            return None
-        candle = analyzed_df.iloc[-1].to_dict()
-        current_time = candle.get("date", datetime.now(UTC))
+            return ConditionalInstructionResult(instruction=None, data_ready=False, candle_time=None)
+        data_ready = len(analyzed_df) > 0
+        if not data_ready:
+            return ConditionalInstructionResult(instruction=None, data_ready=False, candle_time=None)
+        candle_series = analyzed_df.iloc[-1]
+        candle = candle_series.to_dict()
+        candle_time = candle_series["date"]
+        current_time = candle_time or datetime.now(UTC)
         current_rate = self.exchange.get_rate(
             pair, side="entry", is_short=False, refresh=refresh_price
         )
@@ -727,7 +737,20 @@ class FreqtradeBot(LoggingMixin):
             current_rate=current_rate,
             candle=candle,
         )
-        return self._normalize_conditional_instruction(instruction)
+        result = ConditionalInstructionResult(
+            instruction=self._normalize_conditional_instruction(instruction),
+            data_ready=True,
+            candle_time=candle_time,
+        )
+        logger.debug(
+            "Conditional instruction eval for %s: direction=%s trigger=%s data_ready=%s refresh=%s",
+            pair,
+            result.instruction.direction if result.instruction else None,
+            result.instruction.trigger_price if result.instruction else None,
+            result.data_ready,
+            refresh_price,
+        )
+        return result
 
     def _place_conditional_order(
         self,
@@ -766,7 +789,27 @@ class FreqtradeBot(LoggingMixin):
     def _extract_order_trigger_price(self, order: CcxtOrder, order_obj: Order) -> float | None:
         trigger_prop = self.exchange._ft_has.get("conditional_trigger_prop", "triggerPrice")
         trigger_price = safe_value_fallback(order, "stopPrice", trigger_prop, order_obj.stop_price)
-        return trigger_price or order_obj.stop_price
+        logger.debug(
+            "Conditional order trigger extraction for %s (%s): stopPrice=%s %s=%s stored=%s",
+            order_obj.order_id,
+            order.get("status"),
+            order.get("stopPrice"),
+            trigger_prop,
+            order.get(trigger_prop),
+            order_obj.stop_price,
+        )
+        if trigger_price:
+            try:
+                return float(trigger_price)
+            except (TypeError, ValueError):
+                logger.debug(
+                    "Trigger price conversion failed for %s: %s", order_obj.order_id, trigger_price
+                )
+        placement_price = order_obj.safe_placement_price
+        logger.debug(
+            "Using placement price fallback for %s: %s", order_obj.order_id, placement_price
+        )
+        return float(placement_price) if placement_price else None
 
     def _is_conditional_entry_order(
         self, trade: Trade, order_obj: Order, order: CcxtOrder
@@ -797,16 +840,58 @@ class FreqtradeBot(LoggingMixin):
         order: CcxtOrder,
         instruction: ConditionalOrderInstruction | None,
         latest_candle_time: datetime | None,
+        data_ready: bool,
     ) -> None:
+        logger.debug(
+            "Managing conditional order %s for %s | current_trigger=%s instruction=%s data_ready=%s",
+            order_obj.order_id,
+            trade.pair,
+            self._extract_order_trigger_price(order, order_obj),
+            (instruction.direction, instruction.trigger_price) if instruction else None,
+            data_ready,
+        )
         if instruction is None:
-            logger.debug("Cancelling conditional order for %s - strategy returned no instruction.", trade.pair)
-            self.handle_cancel_enter(
-                trade,
-                order,
-                order_obj,
-                constants.CANCEL_REASON["USER_CANCEL"],
-                replacing=False,
+            should_cancel = (
+                data_ready
+                and latest_candle_time is not None
+                and order_obj.order_date_utc <= latest_candle_time
             )
+            grace_minutes = getattr(
+                self.strategy, "conditional_order_cancel_grace_minutes", 0
+            ) or 0
+            if grace_minutes > 0 and order_obj.order_date_utc:
+                age_minutes = (datetime.now(UTC) - order_obj.order_date_utc).total_seconds() / 60
+                if age_minutes < grace_minutes:
+                    logger.debug(
+                        "No conditional instruction for %s yet, but grace period (%s min) "
+                        "not reached (age %.2f min). Keeping order %s.",
+                        trade.pair,
+                        grace_minutes,
+                        age_minutes,
+                        order_obj.order_id,
+                    )
+                    return
+            if should_cancel:
+                logger.debug(
+                    "Cancelling conditional order for %s - strategy returned no instruction "
+                    "for candle %s.",
+                    trade.pair,
+                    latest_candle_time,
+                )
+                self.handle_cancel_enter(
+                    trade,
+                    order,
+                    order_obj,
+                    constants.CANCEL_REASON["USER_CANCEL"],
+                    replacing=False,
+                )
+            else:
+                logger.debug(
+                    "No conditional instruction for %s yet (candle=%s). Keeping order %s.",
+                    trade.pair,
+                    latest_candle_time,
+                    order_obj.order_id,
+                )
             return
 
         desired_short = instruction.direction == SignalDirection.SHORT
@@ -872,9 +957,10 @@ class FreqtradeBot(LoggingMixin):
         (signal, enter_tag) = self.strategy.get_entry_signal(
             pair, self.strategy.timeframe, analyzed_df
         )
-        cond_instruction = self._get_conditional_instruction(
+        cond_result = self._get_conditional_instruction(
             pair, analyzed_df, refresh_price=not signal
         )
+        cond_instruction = cond_result.instruction
 
         if signal:
             trade_side: LongShort = "short" if signal == SignalDirection.SHORT else "long"
@@ -1815,8 +1901,7 @@ class FreqtradeBot(LoggingMixin):
         """
         for trade in Trade.get_open_trades():
             cond_df = None
-            cond_instruction: ConditionalOrderInstruction | None = None
-            cond_candle_time: datetime | None = None
+            cond_result: ConditionalInstructionResult | None = None
             open_order: Order
             for open_order in trade.open_orders:
                 try:
@@ -1841,13 +1926,16 @@ class FreqtradeBot(LoggingMixin):
                         cond_df, _ = self.dataprovider.get_analyzed_dataframe(
                             trade.pair, self.strategy.timeframe
                         )
-                        cond_instruction = self._get_conditional_instruction(
+                        cond_result = self._get_conditional_instruction(
                             trade.pair, cond_df, refresh_price=False
                         )
-                        if cond_df is not None and len(cond_df) > 0:
-                            cond_candle_time = cond_df.iloc[-1]["date"]
                     self._manage_conditional_open_order(
-                        trade, open_order, order, cond_instruction, cond_candle_time
+                        trade,
+                        open_order,
+                        order,
+                        cond_result.instruction if cond_result else None,
+                        cond_result.candle_time if cond_result else None,
+                        cond_result.data_ready if cond_result else False,
                     )
                     continue
 

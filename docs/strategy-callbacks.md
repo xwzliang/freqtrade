@@ -523,6 +523,7 @@ from freqtrade.enums import SignalDirection
 
 class AwesomeStrategy(IStrategy):
     use_custom_conditional_orders = True
+    conditional_order_cancel_grace_minutes = 2  # wait 2 minutes before cancelling when callback returns None
 
     def custom_conditional_orders(
         self,
