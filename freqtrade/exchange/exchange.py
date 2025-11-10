@@ -171,6 +171,7 @@ class Exchange:
         "conditional_trigger_param": "triggerPrice",
         "conditional_trigger_prop": "triggerPrice",
         "conditional_underlying_type": "market",
+        "incremental_ohlcv_refresh": True,
     }
     _ft_has: FtHas = {}
     _ft_has_futures: FtHas = {}
@@ -228,6 +229,17 @@ class Exchange:
         # Deep merge ft_has with default ft_has options
         # Must be called before ft_has is used.
         self.build_ft_has(exchange_conf)
+
+        incremental_refresh_conf = exchange_conf.get("incremental_ohlcv_refresh")
+        self._incremental_ohlcv_refresh: bool = (
+            incremental_refresh_conf
+            if incremental_refresh_conf is not None
+            else self._ft_has.get("incremental_ohlcv_refresh", True)
+        )
+        incremental_lookback_conf = int(exchange_conf.get("incremental_ohlcv_lookback", 2))
+        if incremental_lookback_conf < 1:
+            raise ConfigurationError("exchange.incremental_ohlcv_lookback must be at least 1.")
+        self._incremental_ohlcv_lookback: int = incremental_lookback_conf
 
         # Holds last candle refreshed time of each pair
         self._pairs_last_refresh_time: dict[PairWithTimeframe, int] = {}
@@ -2664,6 +2676,8 @@ class Exchange:
         cache: bool,
     ) -> Coroutine[Any, Any, OHLCVResponse]:
         not_all_data = cache and self.required_candle_call_count > 1
+        hist_since_ms = since_ms
+        incremental_since_ms: int | None = None
         if cache:
             if self._can_use_websocket(self._exchange_ws, pair, timeframe, candle_type):
                 # Subscribe to websocket
@@ -2688,23 +2702,36 @@ class Exchange:
                 )
                 del self._klines[(pair, timeframe, candle_type)]
 
-        if not since_ms and (self._ft_has["ohlcv_require_since"] or not_all_data):
+        if (
+            cache
+            and hist_since_ms is None
+            and self._incremental_ohlcv_refresh
+            and (pair, timeframe, candle_type) in self._klines
+        ):
+            last_refresh = self._pairs_last_refresh_time.get((pair, timeframe, candle_type))
+            if last_refresh is not None:
+                tf_msecs = timeframe_to_msecs(timeframe)
+                incremental_since_ms = max(
+                    0, last_refresh - tf_msecs * self._incremental_ohlcv_lookback
+                )
+
+        if not hist_since_ms and (self._ft_has["ohlcv_require_since"] or not_all_data):
             # Multiple calls for one pair - to get more history
             one_call = timeframe_to_msecs(timeframe) * self.ohlcv_candle_limit(
-                timeframe, candle_type, since_ms
+                timeframe, candle_type, hist_since_ms
             )
             move_to = one_call * self.required_candle_call_count
             now = timeframe_to_next_date(timeframe)
-            since_ms = dt_ts(now - timedelta(seconds=move_to // 1000))
+            hist_since_ms = dt_ts(now - timedelta(seconds=move_to // 1000))
 
-        if since_ms:
+        if hist_since_ms:
             return self._async_get_historic_ohlcv(
-                pair, timeframe, since_ms=since_ms, raise_=True, candle_type=candle_type
+                pair, timeframe, since_ms=hist_since_ms, raise_=True, candle_type=candle_type
             )
         else:
             # One call ... "regular" refresh
             return self._async_get_candle_history(
-                pair, timeframe, since_ms=since_ms, candle_type=candle_type
+                pair, timeframe, since_ms=incremental_since_ms, candle_type=candle_type
             )
 
     def _build_ohlcv_dl_jobs(

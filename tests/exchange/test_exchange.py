@@ -2341,6 +2341,52 @@ def test_refresh_latest_ohlcv(mocker, default_conf_usdt, caplog, candle_type) ->
         assert len(res) == 1
 
 
+def test_refresh_latest_ohlcv_incremental_fetch(mocker, default_conf_usdt) -> None:
+    default_conf_usdt["exchange"]["incremental_ohlcv_refresh"] = True
+    default_conf_usdt["exchange"]["incremental_ohlcv_lookback"] = 2
+    exchange = get_patched_exchange(mocker, default_conf_usdt)
+    base_ts = 1_700_000_000_000
+    tf = 60 * 1000
+    ohlcv_full = [
+        [base_ts + tf * i, 1, 2, 3, 4, 5] for i in range(4)
+    ]
+    ohlcv_incremental = [
+        [base_ts + tf * i, 2, 3, 4, 5, 6] for i in range(2, 6)
+    ]
+    fetch_mock = get_mock_coro(side_effect=[ohlcv_full, ohlcv_incremental])
+    exchange._api_async.fetch_ohlcv = fetch_mock
+
+    pair = ("IOTA/USDT", "1m", CandleType.SPOT)
+    exchange.refresh_latest_ohlcv([pair])
+    exchange.refresh_latest_ohlcv([pair])
+
+    assert fetch_mock.call_count == 2
+    first_kwargs = fetch_mock.call_args_list[0][1]
+    second_kwargs = fetch_mock.call_args_list[1][1]
+    assert first_kwargs["since"] is None
+    assert second_kwargs["since"] == base_ts
+    assert first_kwargs["limit"] == second_kwargs["limit"]
+
+
+def test_refresh_latest_ohlcv_incremental_disabled(mocker, default_conf_usdt) -> None:
+    default_conf_usdt["exchange"]["incremental_ohlcv_refresh"] = False
+    exchange = get_patched_exchange(mocker, default_conf_usdt)
+    base_ts = 1_700_000_000_000
+    tf = 60 * 1000
+    ohlcv_full = [
+        [base_ts + tf * i, 1, 2, 3, 4, 5] for i in range(4)
+    ]
+    fetch_mock = get_mock_coro(side_effect=[ohlcv_full, ohlcv_full])
+    exchange._api_async.fetch_ohlcv = fetch_mock
+
+    pair = ("IOTA/USDT", "1m", CandleType.SPOT)
+    exchange.refresh_latest_ohlcv([pair])
+    exchange.refresh_latest_ohlcv([pair])
+
+    assert fetch_mock.call_count == 2
+    assert fetch_mock.call_args_list[1][1]["since"] is None
+
+
 @pytest.mark.parametrize("candle_type", [CandleType.FUTURES, CandleType.SPOT])
 def test_refresh_latest_trades(
     mocker, default_conf, caplog, candle_type, tmp_path, time_machine
