@@ -60,6 +60,8 @@ class Binance(Exchange):
             PriceType.LAST: "CONTRACT_PRICE",
             PriceType.MARK: "MARK_PRICE",
         },
+        "conditional_trigger_param": "stopPrice",
+        "conditional_trigger_prop": "stopPrice",
         "ws_enabled": False,
         "proxy_coin_mapping": {
             "BNFCR": "USDC",

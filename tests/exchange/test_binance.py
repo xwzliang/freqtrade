@@ -161,6 +161,32 @@ def test_create_stoploss_order_binance_hedge_mode(default_conf, mocker):
     assert params == {"stopPrice": 220, "workingType": "MARK_PRICE"}
 
 
+def test_create_conditional_order_binance_hedge_mode(default_conf, mocker):
+    api_mock = MagicMock()
+    api_mock.create_order = MagicMock(return_value={"id": "cond_1", "info": {}})
+    default_conf["dry_run"] = False
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    mocker.patch(f"{EXMS}.amount_to_precision", lambda s, x, y: y)
+    mocker.patch(f"{EXMS}.price_to_precision", lambda s, x, y, **kwargs: y)
+    exchange = get_patched_exchange(mocker, default_conf, api_mock, "binance")
+    exchange.hedge_mode = True
+
+    exchange.create_order(
+        pair="ETH/BTC",
+        ordertype="conditional",
+        side="sell",
+        amount=1,
+        rate=0.046,
+        leverage=5,
+        trigger_price=0.045,
+    )
+
+    params = api_mock.create_order.call_args_list[0][1]["params"]
+    assert params["stopPrice"] == 0.045
+    assert params["positionSide"] == "SHORT"
+
+
 def test_create_stoploss_order_dry_run_binance(default_conf, mocker):
     api_mock = MagicMock()
     order_type = "stop_loss_limit"
