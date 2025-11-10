@@ -2064,6 +2064,47 @@ def test_update_order_from_ccxt(caplog, time_machine):
 
 
 @pytest.mark.usefixtures("init_persistence")
+def test_parse_order_stopprice_fallback():
+    stop_price = 12.34
+    order = {
+        "id": "missing-price-stop",
+        "side": "sell",
+        "symbol": "ADA/USDT",
+        "type": "stop_market",
+        "price": None,
+        "stopPrice": stop_price,
+        "amount": 25.0,
+        "status": "open",
+        "timestamp": 1599394315123,
+    }
+
+    o = Order.parse_from_ccxt_object(order, "ADA/USDT", "sell")
+    assert o.ft_price == pytest.approx(stop_price)
+    assert o.ft_amount == 25.0
+
+
+@pytest.mark.usefixtures("init_persistence")
+def test_parse_order_missing_price_defaults_to_zero(caplog):
+    order = {
+        "id": "missing-price",
+        "side": "sell",
+        "symbol": "ADA/USDT",
+        "type": "market",
+        "price": None,
+        "amount": 0.0,
+        "filled": 0.0,
+        "status": "canceled",
+        "timestamp": 1599394315123,
+    }
+
+    with caplog.at_level("WARNING"):
+        o = Order.parse_from_ccxt_object(order, "ADA/USDT", "sell")
+
+    assert o.ft_price == 0.0
+    assert "missing price information" in caplog.text
+
+
+@pytest.mark.usefixtures("init_persistence")
 @pytest.mark.parametrize("is_short", [True, False])
 def test_select_order(fee, is_short):
     create_mock_trades(fee, is_short)

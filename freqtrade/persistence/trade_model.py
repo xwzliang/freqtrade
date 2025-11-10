@@ -4,7 +4,7 @@ This module contains the class to persist trades into SQLite
 
 import logging
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isclose
@@ -352,16 +352,70 @@ class Order(ModelBase):
         Parse an order from a ccxt object and return a new order Object.
         Optional support for overriding amount and price is only used for test simplification.
         """
+        ft_amount = amount or order.get("amount", None) or 0.0
+        ft_price = cls._resolve_ft_price(order, price, ft_amount)
+
         o = cls(
             order_id=str(order["id"]),
             ft_order_side=side,
             ft_pair=pair,
-            ft_amount=amount or order.get("amount", None) or 0.0,
-            ft_price=price or order.get("price", None),
+            ft_amount=ft_amount,
+            ft_price=ft_price,
         )
 
         o.update_from_ccxt_object(order)
         return o
+
+    @staticmethod
+    def _resolve_ft_price(order: CcxtOrder, explicit_price: float | None, amount: float) -> float:
+        """
+        Try to determine a sensible price for persistence.
+        Exchanges sometimes omit price information (e.g., triggered stop orders or liquidations),
+        which previously resulted in NULL constraint violations.
+        """
+
+        def iter_candidates():
+            yield explicit_price
+            yield order.get("price")
+            yield safe_value_fallback(order, "stopPrice", "triggerPrice")
+            yield order.get("average")
+            info = order.get("info")
+            if isinstance(info, Mapping):
+                yield info.get("price")
+                yield safe_value_fallback(info, "stopPrice", "triggerPrice")
+                yield info.get("average")
+                yield info.get("avgPrice")
+                yield info.get("avgEntryPrice")
+                yield info.get("avgExecutionPrice")
+
+        for candidate in iter_candidates():
+            if candidate is not None:
+                return candidate
+
+        cost = order.get("cost")
+        if cost not in (None, 0):
+            amount_for_cost = next(
+                (
+                    amt
+                    for amt in (
+                        order.get("filled"),
+                        amount,
+                        order.get("amount"),
+                    )
+                    if amt not in (None, 0)
+                ),
+                None,
+            )
+            if amount_for_cost:
+                derived_price = cost / amount_for_cost
+                if derived_price:
+                    return derived_price
+
+        logger.warning(
+            "Order %s missing price information; storing ft_price=0.0 to keep bot running.",
+            order.get("id", "unknown"),
+        )
+        return 0.0
 
     @staticmethod
     def get_open_orders() -> Sequence["Order"]:
