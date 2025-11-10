@@ -943,6 +943,46 @@ class FreqtradeBot(LoggingMixin):
                 replacing=True,
             )
 
+    def _update_existing_conditional_order(
+        self,
+        pair: str,
+        instruction: ConditionalOrderInstruction,
+        cond_result: ConditionalInstructionResult,
+    ) -> bool:
+        """
+        Update an existing conditional order for the same pair/side instead of creating a new one.
+        Returns True if an update (or confirmation) was attempted, False otherwise.
+        """
+        cond_side: LongShort = (
+            "short" if instruction.direction == SignalDirection.SHORT else "long"
+        )
+        open_trades = Trade.get_trades_proxy(pair=pair, is_open=True)
+        for trade in open_trades:
+            if trade.trade_direction != cond_side:
+                continue
+            for order_obj in trade.open_orders:
+                try:
+                    order = self.exchange.fetch_order(order_obj.order_id, trade.pair)
+                except ExchangeError:
+                    logger.info(
+                        "Unable to fetch order %s for %s to update conditional trigger.",
+                        order_obj.order_id,
+                        trade.pair,
+                    )
+                    continue
+                if not self._is_conditional_entry_order(trade, order_obj, order):
+                    continue
+                self._manage_conditional_open_order(
+                    trade,
+                    order_obj,
+                    order,
+                    instruction,
+                    cond_result.candle_time,
+                    cond_result.data_ready,
+                )
+                return True
+        return False
+
     def create_trade(self, pair: str) -> bool:
         """
         Check the implemented trading strategy for entry signals.
@@ -1013,6 +1053,10 @@ class FreqtradeBot(LoggingMixin):
                 pair, stake_amount, enter_tag=enter_tag, is_short=(signal == SignalDirection.SHORT)
             )
         elif cond_instruction:
+            if self.exchange.hedge_mode and self._update_existing_conditional_order(
+                pair, cond_instruction, cond_result
+            ):
+                return False
             return self._place_conditional_order(pair, cond_instruction, nowtime)
         else:
             return False

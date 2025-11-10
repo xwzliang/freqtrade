@@ -1218,6 +1218,48 @@ def test_create_trade_conditional_order(mocker, default_conf_usdt) -> None:
 
 
 @pytest.mark.usefixtures("init_persistence")
+def test_create_trade_conditional_order_updates_existing(mocker, default_conf_usdt) -> None:
+    freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
+    freqtrade.exchange.hedge_mode = True
+    freqtrade.strategy.custom_conditional_orders = MagicMock(
+        side_effect=[(SignalDirection.SHORT, 90.0), (SignalDirection.SHORT, 80.0)]
+    )
+    mocker.patch(f"{EXMS}.get_rate", MagicMock(return_value=100.0))
+    order = {
+        "id": "cond_existing",
+        "status": "open",
+        "type": "conditional",
+        "side": "sell",
+        "amount": 1.0,
+        "filled": 0.0,
+        "remaining": 1.0,
+        "price": None,
+        "average": None,
+        "cost": 0.0,
+        "stopPrice": 90.0,
+    }
+    mocker.patch(f"{EXMS}.create_order", MagicMock(return_value=order))
+
+    assert freqtrade.create_trade("ETH/USDT")
+    trade = Trade.get_open_trades()[0]
+    order_obj = trade.open_orders[0]
+    order_obj.order_type = "conditional"
+
+    fetch_order_mock = mocker.patch(
+        f"{EXMS}.fetch_order",
+        return_value={**order, "id": order_obj.order_id},
+    )
+    manage_mock = mocker.patch.object(freqtrade, "_manage_conditional_open_order")
+    mocker.patch.object(freqtrade, "_is_conditional_entry_order", return_value=True)
+    freqtrade._place_conditional_order = MagicMock()
+
+    assert not freqtrade.create_trade("ETH/USDT")
+    fetch_order_mock.assert_called_once_with(order_obj.order_id, trade.pair)
+    manage_mock.assert_called_once()
+    freqtrade._place_conditional_order.assert_not_called()
+
+
+@pytest.mark.usefixtures("init_persistence")
 def test_manage_open_orders_updates_conditional_price(mocker, default_conf_usdt) -> None:
     freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
     freqtrade.strategy.custom_conditional_orders = MagicMock(
