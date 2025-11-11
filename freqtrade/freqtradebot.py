@@ -1029,6 +1029,15 @@ class FreqtradeBot(LoggingMixin):
         msg = str(exception).lower()
         return "immediate" in msg and "trigger" in msg
 
+    def _get_stoploss_ratio(self, trade: Trade) -> float | None:
+        ratio = trade.stop_loss_pct or trade.initial_stop_loss_pct
+        if ratio is not None:
+            return float(ratio)
+        strategy_stop = getattr(self.strategy, "stoploss", None)
+        if strategy_stop is not None:
+            return float(strategy_stop)
+        return None
+
     def _sanitize_stoploss_price(self, trade: Trade, stop_price: float) -> float:
         """
         Ensure stoploss price is on the correct side of the current rate so exchanges don't reject
@@ -1048,17 +1057,32 @@ class FreqtradeBot(LoggingMixin):
         except Exception:
             return stop_price
 
+        ratio = self._get_stoploss_ratio(trade)
+        leverage = trade.leverage or 1.0
+        ratio_adj = abs(ratio / leverage) if ratio is not None else None
+
+        def apply_ratio(rate: float) -> float | None:
+            if ratio_adj is None or ratio_adj == 0:
+                return None
+            if trade.is_short:
+                return rate * (1 + ratio_adj)
+            return rate * (1 - ratio_adj)
+
         adjusted_price: float | None = None
         rounding = ROUND_UP if trade.is_short else ROUND_DOWN
 
-        if trade.is_short:
+        if trade.is_short and stop_price <= current_rate:
+            target = apply_ratio(current_rate)
             min_allowed = current_rate * (1 + minimal_buffer)
-            if stop_price <= min_allowed:
-                adjusted_price = min_allowed
-        else:
-            max_allowed = current_rate * (1 - minimal_buffer)
-            if stop_price >= max_allowed:
-                adjusted_price = max(max_allowed, 0.0)
+            adjusted_price = (
+                max(target, min_allowed) if target is not None else min_allowed
+            )
+        elif not trade.is_short and stop_price >= current_rate:
+            target = apply_ratio(current_rate)
+            max_allowed = max(current_rate * (1 - minimal_buffer), 0.0)
+            adjusted_price = (
+                min(target, max_allowed) if target is not None else max_allowed
+            )
 
         if adjusted_price is None:
             return stop_price
@@ -1073,6 +1097,7 @@ class FreqtradeBot(LoggingMixin):
                 stop_price,
                 sanitized,
             )
+            trade.stop_loss = sanitized
         return sanitized
 
     def create_trade(self, pair: str) -> bool:

@@ -642,10 +642,14 @@ def test_create_stoploss_order_adjusts_short_price(mocker, default_conf_usdt) ->
     stoploss_mock = MagicMock(return_value={"id": "sl", "amount": trade.amount, "price": 0.32})
     freqtrade.exchange.create_stoploss = stoploss_mock
 
+    trade.stop_loss_pct = -0.05
+    trade.stop_loss = 0.2
+
     freqtrade.create_stoploss_order(trade, stop_price=0.2)
 
     called_stop_price = stoploss_mock.call_args[1]["stop_price"]
-    assert called_stop_price > 0.31
+    expected = 0.31 * (1 + (0.05 / trade.leverage))
+    assert called_stop_price == pytest.approx(expected)
 
 
 @pytest.mark.usefixtures("init_persistence")
@@ -673,10 +677,14 @@ def test_create_stoploss_order_adjusts_long_price(mocker, default_conf_usdt) -> 
     stoploss_mock = MagicMock(return_value={"id": "sl", "amount": trade.amount, "price": 0.32})
     freqtrade.exchange.create_stoploss = stoploss_mock
 
+    trade.stop_loss_pct = -0.05
+    trade.stop_loss = 0.35
+
     freqtrade.create_stoploss_order(trade, stop_price=0.35)
 
     called_stop_price = stoploss_mock.call_args[1]["stop_price"]
-    assert called_stop_price < 0.31
+    expected = 0.31 * (1 - (0.05 / trade.leverage))
+    assert called_stop_price == pytest.approx(expected)
 
 
 @pytest.mark.usefixtures("init_persistence")
