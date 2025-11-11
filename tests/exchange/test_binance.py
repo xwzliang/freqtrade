@@ -402,9 +402,58 @@ def test_liquidation_price_binance(
                 ),
                 2,
             )
-        )
-        == expected
     )
+    == expected
+)
+
+
+def test_get_liquidation_price_hedge_mode_selects_side(default_conf, mocker):
+    pair = "UAI/USDT:USDT"
+    default_conf["dry_run"] = False
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    default_conf["liquidation_buffer"] = 0.0
+
+    exchange = get_patched_exchange(mocker, default_conf, exchange="binance")
+    exchange.hedge_mode = True
+
+    positions = [
+        {
+            "symbol": pair,
+            "side": "long",
+            "contracts": 10.0,
+            "liquidationPrice": 0.154,
+        },
+        {
+            "symbol": pair,
+            "side": "short",
+            "contracts": 10.0,
+            "liquidationPrice": 0.214,
+        },
+    ]
+    exchange.fetch_positions = MagicMock(return_value=positions)
+
+    liq_short = exchange.get_liquidation_price(
+        pair=pair,
+        open_rate=0.18,
+        is_short=True,
+        amount=10.0,
+        stake_amount=2.0,
+        leverage=5.0,
+        wallet_balance=2.0,
+    )
+    liq_long = exchange.get_liquidation_price(
+        pair=pair,
+        open_rate=0.18,
+        is_short=False,
+        amount=10.0,
+        stake_amount=2.0,
+        leverage=5.0,
+        wallet_balance=2.0,
+    )
+
+    assert liq_short == pytest.approx(0.214)
+    assert liq_long == pytest.approx(0.154)
 
 
 def test_fill_leverage_tiers_binance(default_conf, mocker):

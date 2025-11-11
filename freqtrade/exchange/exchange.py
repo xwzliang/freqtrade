@@ -3954,9 +3954,62 @@ class Exchange:
             )
         else:
             positions = self.fetch_positions(pair)
-            if len(positions) > 0:
-                pos = positions[0]
-                liquidation_price = pos["liquidationPrice"]
+            if positions:
+                desired_side = "short" if is_short else "long"
+
+                def _symbol_matches(position: CcxtPosition) -> bool:
+                    symbol = position.get("symbol") or position.get("info", {}).get("symbol")
+                    return symbol == pair if pair else True
+
+                def _contracts_value(position: CcxtPosition) -> float:
+                    contracts = position.get("contracts")
+                    if contracts in (None, ""):
+                        contracts = position.get("info", {}).get("positionAmt")
+                    try:
+                        return float(contracts)
+                    except (TypeError, ValueError):
+                        return 0.0
+
+                def _side_matches(position: CcxtPosition) -> bool:
+                    side_val = position.get("side") or position.get("info", {}).get("positionSide")
+                    side_val = (side_val or "").lower()
+                    if side_val in ("long", "short"):
+                        return side_val == desired_side
+                    if side_val == "both":
+                        return True
+                    contracts = _contracts_value(position)
+                    if contracts == 0.0:
+                        return False
+                    # Sign of contracts is only meaningful in one-way mode.
+                    return (contracts < 0.0) if is_short else (contracts > 0.0)
+
+                matching_positions = [p for p in positions if _symbol_matches(p)] or positions
+
+                candidate: CcxtPosition | None = None
+                if self.hedge_mode:
+                    for pos in matching_positions:
+                        if _side_matches(pos) and abs(_contracts_value(pos)) > 0.0:
+                            candidate = pos
+                            break
+                    if candidate is None:
+                        candidate = next(
+                            (p for p in matching_positions if _side_matches(p)), None
+                        )
+                if candidate is None:
+                    candidate = next(
+                        (p for p in matching_positions if abs(_contracts_value(p)) > 0.0),
+                        None,
+                    )
+                if candidate is None:
+                    candidate = matching_positions[0]
+
+                raw_liquidation = candidate.get("liquidationPrice")
+                try:
+                    liquidation_price = float(raw_liquidation)
+                except (TypeError, ValueError):
+                    liquidation_price = None
+                if liquidation_price is not None and liquidation_price <= 0.0:
+                    liquidation_price = None
 
         if liquidation_price is not None:
             buffer_amount = abs(open_rate - liquidation_price) * self.liquidation_buffer
