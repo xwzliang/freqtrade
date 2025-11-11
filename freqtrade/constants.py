@@ -200,6 +200,7 @@ CANCEL_REASON = {
     "REPLACE": "cancelled to be replaced by new limit order",
     "REPLACE_FAILED": "failed to replace order, deleting Trade",
     "USER_CANCEL": "user requested order cancel",
+    "CONDITIONAL_BLOCK": "cancelled due to triggered conditional order",
 }
 
 # List of pairs with their timeframes

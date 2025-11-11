@@ -10,7 +10,7 @@ from datetime import UTC, datetime, time, timedelta
 from math import isclose
 from threading import Lock
 from time import sleep
-from typing import Any
+from typing import Any, Sequence
 
 from schedule import Scheduler
 
@@ -872,6 +872,8 @@ class FreqtradeBot(LoggingMixin):
         instruction: ConditionalOrderInstruction | None,
         latest_candle_time: datetime | None,
         data_ready: bool,
+        *,
+        open_trades_snapshot: Sequence[Trade] | None = None,
     ) -> None:
         logger.debug(
             "Managing conditional order %s for %s | current_trigger=%s instruction=%s data_ready=%s",
@@ -881,6 +883,25 @@ class FreqtradeBot(LoggingMixin):
             (instruction.direction, instruction.trigger_price) if instruction else None,
             data_ready,
         )
+        desired_direction = SignalDirection.SHORT if trade.is_short else SignalDirection.LONG
+        if self._conditional_direction_blocked(
+            desired_direction,
+            open_trades_snapshot=open_trades_snapshot,
+            ignore_trade_id=trade.id,
+        ):
+            logger.info(
+                "Cancelling conditional order for %s - %s entry already triggered elsewhere.",
+                trade.pair,
+                desired_direction.value,
+            )
+            self.handle_cancel_enter(
+                trade,
+                order,
+                order_obj,
+                constants.CANCEL_REASON["CONDITIONAL_BLOCK"],
+                replacing=False,
+            )
+            return
         if instruction is None:
             should_cancel = (
                 data_ready
@@ -982,6 +1003,7 @@ class FreqtradeBot(LoggingMixin):
             "short" if instruction.direction == SignalDirection.SHORT else "long"
         )
         open_trades = Trade.get_trades_proxy(pair=pair, is_open=True)
+        all_open_trades = Trade.get_open_trades()
         for trade in open_trades:
             if trade.trade_direction != cond_side:
                 continue
@@ -1004,7 +1026,41 @@ class FreqtradeBot(LoggingMixin):
                     instruction,
                     cond_result.candle_time,
                     cond_result.data_ready,
+                    open_trades_snapshot=all_open_trades,
                 )
+                return True
+        return False
+
+    @staticmethod
+    def _trade_uses_conditional_entry(trade: Trade) -> bool:
+        return isinstance(trade.enter_tag, str) and trade.enter_tag.startswith("conditional")
+
+    def _trade_is_triggered_conditional(self, trade: Trade) -> bool:
+        return (
+            trade.is_open
+            and trade.nr_of_successful_entries > 0
+            and self._trade_uses_conditional_entry(trade)
+        )
+
+    def _conditional_direction_blocked(
+        self,
+        direction: SignalDirection,
+        *,
+        open_trades_snapshot: Sequence[Trade] | None = None,
+        ignore_trade_id: int | None = None,
+    ) -> bool:
+        """
+        Check whether a conditional entry for the provided direction should be blocked because
+        another conditional order in the same direction has already triggered and is still active.
+        """
+        trades = open_trades_snapshot if open_trades_snapshot is not None else Trade.get_open_trades()
+        for open_trade in trades:
+            if ignore_trade_id is not None and open_trade.id == ignore_trade_id:
+                continue
+            if not self._trade_is_triggered_conditional(open_trade):
+                continue
+            active_direction = SignalDirection.SHORT if open_trade.is_short else SignalDirection.LONG
+            if active_direction == direction:
                 return True
         return False
 
@@ -1168,6 +1224,13 @@ class FreqtradeBot(LoggingMixin):
                 pair, stake_amount, enter_tag=enter_tag, is_short=(signal == SignalDirection.SHORT)
             )
         elif cond_instruction:
+            if self._conditional_direction_blocked(cond_instruction.direction):
+                logger.debug(
+                    "Skipping conditional order for %s - %s conditional entry already active.",
+                    pair,
+                    cond_instruction.direction.value,
+                )
+                return False
             if self.exchange.hedge_mode and self._update_existing_conditional_order(
                 pair, cond_instruction, cond_result
             ):
@@ -2119,7 +2182,8 @@ class FreqtradeBot(LoggingMixin):
         Timeout setting takes priority over limit order adjustment request.
         :return: None
         """
-        for trade in Trade.get_open_trades():
+        open_trades = Trade.get_open_trades()
+        for trade in open_trades:
             cond_df = None
             cond_result: ConditionalInstructionResult | None = None
             open_order: Order
@@ -2156,6 +2220,7 @@ class FreqtradeBot(LoggingMixin):
                         cond_result.instruction if cond_result else None,
                         cond_result.candle_time if cond_result else None,
                         cond_result.data_ready if cond_result else False,
+                        open_trades_snapshot=open_trades,
                     )
                     continue
 
