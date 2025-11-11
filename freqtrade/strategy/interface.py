@@ -84,6 +84,7 @@ class IStrategy(ABC, HyperStrategyMixin):
     trailing_only_offset_is_reached = False
     use_custom_stoploss: bool = False
     use_custom_conditional_orders: bool = False
+    conditional_order_market_fallback: bool = False
     conditional_order_cancel_grace_minutes: int = 0
 
     # Can this strategy go short?

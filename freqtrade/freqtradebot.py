@@ -789,15 +789,33 @@ class FreqtradeBot(LoggingMixin):
             logger.warning("No stake amount available for conditional order on %s.", pair)
             return False
 
-        return self.execute_entry(
-            pair=pair,
-            stake_amount=stake_amount,
-            price=instruction.trigger_price,
-            is_short=instruction.direction == SignalDirection.SHORT,
-            ordertype="conditional",
-            enter_tag=f"conditional_{instruction.direction.value}",
-            trigger_price=instruction.trigger_price,
-        )
+        fallback_enabled = getattr(self.strategy, "conditional_order_market_fallback", False)
+        try:
+            return self.execute_entry(
+                pair=pair,
+                stake_amount=stake_amount,
+                price=instruction.trigger_price,
+                is_short=instruction.direction == SignalDirection.SHORT,
+                ordertype="conditional",
+                enter_tag=f"conditional_{instruction.direction.value}",
+                trigger_price=instruction.trigger_price,
+            )
+        except InvalidOrderException as exc:
+            if fallback_enabled and self._should_market_fallback(exc):
+                logger.warning(
+                    "Conditional order for %s would trigger immediately. "
+                    "Executing market order instead.",
+                    pair,
+                )
+                return self.execute_entry(
+                    pair=pair,
+                    stake_amount=stake_amount,
+                    price=None,
+                    is_short=instruction.direction == SignalDirection.SHORT,
+                    ordertype="market",
+                    enter_tag=f"conditional_market_{instruction.direction.value}",
+                )
+            raise
 
     def _extract_order_trigger_price(self, order: CcxtOrder, order_obj: Order) -> float | None:
         trigger_prop = self.exchange._ft_has.get("conditional_trigger_prop", "triggerPrice")
@@ -1005,6 +1023,11 @@ class FreqtradeBot(LoggingMixin):
         if not Trade.has_open_trade(pair, opposite_side):
             return False
         return not Trade.has_open_trade(pair, desired_side)
+
+    @staticmethod
+    def _should_market_fallback(exception: Exception) -> bool:
+        msg = str(exception).lower()
+        return "immediate" in msg and "trigger" in msg
 
     def _sanitize_stoploss_price(self, trade: Trade, stop_price: float) -> float:
         """
