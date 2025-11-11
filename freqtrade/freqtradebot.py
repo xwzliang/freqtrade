@@ -1006,6 +1006,52 @@ class FreqtradeBot(LoggingMixin):
             return False
         return not Trade.has_open_trade(pair, desired_side)
 
+    def _sanitize_stoploss_price(self, trade: Trade, stop_price: float) -> float:
+        """
+        Ensure stoploss price is on the correct side of the current rate so exchanges don't reject
+        the order as "would immediately trigger".
+        """
+        if stop_price is None or stop_price <= 0:
+            return stop_price
+
+        price_buffer_pct = getattr(self.strategy, "stoploss_on_exchange_price_buffer", 0.0005)
+        price_buffer_pct = max(0.0, float(price_buffer_pct))
+        minimal_buffer = max(price_buffer_pct, 1e-6)
+
+        try:
+            current_rate = self.exchange.get_rate(
+                trade.pair, side="exit", is_short=trade.is_short, refresh=False
+            )
+        except Exception:
+            return stop_price
+
+        adjusted_price: float | None = None
+        rounding = ROUND_UP if trade.is_short else ROUND_DOWN
+
+        if trade.is_short:
+            min_allowed = current_rate * (1 + minimal_buffer)
+            if stop_price <= min_allowed:
+                adjusted_price = min_allowed
+        else:
+            max_allowed = current_rate * (1 - minimal_buffer)
+            if stop_price >= max_allowed:
+                adjusted_price = max(max_allowed, 0.0)
+
+        if adjusted_price is None:
+            return stop_price
+
+        sanitized = float(
+            self.exchange.price_to_precision(trade.pair, adjusted_price, rounding_mode=rounding)
+        )
+        if not isclose(sanitized, stop_price, rel_tol=0, abs_tol=constants.MATH_CLOSE_PREC):
+            logger.info(
+                "Adjusted stoploss price for %s from %s to %s to avoid immediate trigger.",
+                trade.pair,
+                stop_price,
+                sanitized,
+            )
+        return sanitized
+
     def create_trade(self, pair: str) -> bool:
         """
         Check the implemented trading strategy for entry signals.
@@ -1806,7 +1852,44 @@ class FreqtradeBot(LoggingMixin):
                     return True
         return False
 
-    def create_stoploss_order(self, trade: Trade, stop_price: float) -> bool:
+    def _should_retry_stoploss(self, exception: Exception) -> bool:
+        msg = str(exception).lower()
+        retry_tokens = [
+            "immediate",
+            "trigger",
+            "would immediately trigger",
+            "triggerprice",
+            "rate none",
+        ]
+        return any(token in msg for token in retry_tokens)
+
+    def _retry_stoploss_with_live_rate(self, trade: Trade, original_stop_price: float) -> bool:
+        buffer_pct = getattr(self.strategy, "stoploss_on_exchange_retry_buffer", 0.001)
+        buffer_pct = max(buffer_pct, 1e-6)
+        try:
+            current_rate = self.exchange.get_rate(
+                trade.pair, side="exit", is_short=trade.is_short, refresh=True
+            )
+        except Exception:
+            return False
+        if current_rate <= 0:
+            return False
+        if trade.is_short:
+            new_stop = current_rate * (1 + buffer_pct)
+        else:
+            new_stop = max(current_rate * (1 - buffer_pct), 0.0)
+        logger.warning(
+            "Retrying stoploss placement for %s with recalculated price %.10f "
+            "(previous %.10f).",
+            trade.pair,
+            new_stop,
+            original_stop_price,
+        )
+        return self.create_stoploss_order(trade, new_stop, _retry_on_invalid=False)
+
+    def create_stoploss_order(
+        self, trade: Trade, stop_price: float, *, _retry_on_invalid: bool = True
+    ) -> bool:
         """
         Abstracts creating stoploss orders from the logic.
         Handles errors and updates the trade database object.
@@ -1814,6 +1897,7 @@ class FreqtradeBot(LoggingMixin):
         :return: True if the order succeeded, and False in case of problems.
         """
         try:
+            stop_price = self._sanitize_stoploss_price(trade, stop_price)
             stoploss_order = self.exchange.create_stoploss(
                 pair=trade.pair,
                 amount=trade.amount,
@@ -1835,6 +1919,9 @@ class FreqtradeBot(LoggingMixin):
 
         except InvalidOrderException as e:
             logger.error(f"Unable to place a stoploss order on exchange. {e}")
+            if _retry_on_invalid and self._should_retry_stoploss(e):
+                if self._retry_stoploss_with_live_rate(trade, stop_price):
+                    return True
             logger.warning("Exiting the trade forcefully")
             self.emergency_exit(trade, stop_price)
 

@@ -617,6 +617,100 @@ def test_create_stoploss_order_insufficient_funds(
     assert mock_insuf.call_count == 1
 
 
+@pytest.mark.usefixtures("init_persistence")
+def test_create_stoploss_order_adjusts_short_price(mocker, default_conf_usdt) -> None:
+    freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
+    trade = Trade(
+        pair="ETH/USDT",
+        stake_amount=10.0,
+        fee_open=0.0,
+        fee_close=0.0,
+        is_open=True,
+        amount=5.0,
+        open_rate=0.32,
+        exchange="binance",
+        stake_currency="USDT",
+        base_currency="ETH",
+        is_short=True,
+        leverage=5.0,
+    )
+    Trade.session.add(trade)
+    Trade.commit()
+
+    freqtrade.exchange.get_rate = MagicMock(return_value=0.31)
+    freqtrade.exchange.price_to_precision = MagicMock(side_effect=lambda pair, price, rounding_mode=None: price)
+    stoploss_mock = MagicMock(return_value={"id": "sl", "amount": trade.amount, "price": 0.32})
+    freqtrade.exchange.create_stoploss = stoploss_mock
+
+    freqtrade.create_stoploss_order(trade, stop_price=0.2)
+
+    called_stop_price = stoploss_mock.call_args[1]["stop_price"]
+    assert called_stop_price > 0.31
+
+
+@pytest.mark.usefixtures("init_persistence")
+def test_create_stoploss_order_adjusts_long_price(mocker, default_conf_usdt) -> None:
+    freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
+    trade = Trade(
+        pair="ETH/USDT",
+        stake_amount=10.0,
+        fee_open=0.0,
+        fee_close=0.0,
+        is_open=True,
+        amount=5.0,
+        open_rate=0.32,
+        exchange="binance",
+        stake_currency="USDT",
+        base_currency="ETH",
+        is_short=False,
+        leverage=5.0,
+    )
+    Trade.session.add(trade)
+    Trade.commit()
+
+    freqtrade.exchange.get_rate = MagicMock(return_value=0.31)
+    freqtrade.exchange.price_to_precision = MagicMock(side_effect=lambda pair, price, rounding_mode=None: price)
+    stoploss_mock = MagicMock(return_value={"id": "sl", "amount": trade.amount, "price": 0.32})
+    freqtrade.exchange.create_stoploss = stoploss_mock
+
+    freqtrade.create_stoploss_order(trade, stop_price=0.35)
+
+    called_stop_price = stoploss_mock.call_args[1]["stop_price"]
+    assert called_stop_price < 0.31
+
+
+@pytest.mark.usefixtures("init_persistence")
+def test_create_stoploss_order_retries_on_invalid(mocker, default_conf_usdt) -> None:
+    freqtrade = get_patched_freqtradebot(mocker, default_conf_usdt)
+    trade = Trade(
+        pair="ETH/USDT",
+        stake_amount=10.0,
+        fee_open=0.0,
+        fee_close=0.0,
+        is_open=True,
+        amount=5.0,
+        open_rate=0.32,
+        exchange="binance",
+        stake_currency="USDT",
+        base_currency="ETH",
+        is_short=True,
+        leverage=5.0,
+    )
+    Trade.session.add(trade)
+    Trade.commit()
+
+    freqtrade.exchange.get_rate = MagicMock(side_effect=[0.31, 0.33])
+    freqtrade.exchange.price_to_precision = MagicMock(side_effect=lambda pair, price, rounding_mode=None: price)
+    invalid = InvalidOrderException("Order would immediately trigger. Tried to buy amount at rate None.")
+    stoploss_mock = MagicMock(side_effect=[invalid, {"id": "retry", "amount": trade.amount, "price": 0.34}])
+    freqtrade.exchange.create_stoploss = stoploss_mock
+    freqtrade.emergency_exit = MagicMock()
+
+    assert freqtrade.create_stoploss_order(trade, stop_price=0.2)
+    assert stoploss_mock.call_count == 2
+    freqtrade.emergency_exit.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "is_short,bid,ask,stop_price,hang_price",
     [
