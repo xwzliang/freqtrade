@@ -1307,6 +1307,57 @@ def test_create_trade_conditional_order_opposite_side_bypasses_limit(
 
 
 @pytest.mark.usefixtures("init_persistence")
+def test_handle_replace_order_conditional_sets_trigger(mocker, default_conf_usdt) -> None:
+    freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
+    trade = Trade(
+        pair="ETH/USDT",
+        stake_amount=10.0,
+        fee_open=0.0,
+        fee_close=0.0,
+        is_open=True,
+        amount=1.0,
+        open_rate=100.0,
+        exchange="binance",
+        open_date=dt_now(),
+        is_short=True,
+    )
+    Trade.session.add(trade)
+    Trade.commit()
+
+    order_obj = Order.parse_from_ccxt_object(
+        {"id": "cond123", "amount": 1.0, "price": 90.0, "status": "open"}, trade.pair, "sell"
+    )
+    order_obj.ft_order_tag = "conditional_short"
+    order_obj.order_type = "stop_market"
+    order_obj.stop_price = 90.0
+    trade.orders.append(order_obj)
+    Trade.session.add(order_obj)
+    Trade.commit()
+
+    cancel_mock = mocker.patch.object(
+        freqtrade, "handle_cancel_order", MagicMock(return_value=True)
+    )
+    exec_entry_mock = mocker.patch.object(freqtrade, "execute_entry", return_value=True)
+
+    freqtrade.handle_replace_order(
+        order={"id": "cond123", "status": "open", "stopPrice": 90.0},
+        order_obj=order_obj,
+        trade=trade,
+        new_order_price=85.0,
+        is_entry=True,
+        cancel_reason="replace",
+        replacing=True,
+    )
+
+    cancel_mock.assert_called_once()
+    exec_entry_mock.assert_called_once()
+    kwargs = exec_entry_mock.call_args.kwargs
+    assert kwargs["ordertype"] == "conditional"
+    assert kwargs["trigger_price"] == 85.0
+    assert kwargs["price"] == 85.0
+
+
+@pytest.mark.usefixtures("init_persistence")
 def test_manage_open_orders_updates_conditional_price(mocker, default_conf_usdt) -> None:
     freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
     freqtrade.strategy.custom_conditional_orders = MagicMock(

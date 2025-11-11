@@ -2180,13 +2180,28 @@ class FreqtradeBot(LoggingMixin):
                 if is_entry:
                     entry_ordertype = order_obj.order_type or None
                     trigger_price = None
-                    if (
-                        order_obj.ft_order_tag
-                        and isinstance(order_obj.ft_order_tag, str)
-                        and order_obj.ft_order_tag.startswith("conditional_")
-                    ):
+                    conditional_order = (
+                        (
+                            isinstance(order_obj.ft_order_tag, str)
+                            and order_obj.ft_order_tag.startswith("conditional_")
+                        )
+                        or (entry_ordertype or "").lower()
+                        in {"conditional", "stop", "stop_market", "stop_limit"}
+                        or order_obj.stop_price is not None
+                    )
+                    if conditional_order:
                         entry_ordertype = "conditional"
-                        trigger_price = new_order_price
+                        trigger_price = (
+                            new_order_price
+                            or order_obj.stop_price
+                            or (order or {}).get("stopPrice")
+                            or (order or {}).get("triggerPrice")
+                        )
+                        if trigger_price is None:
+                            logger.warning(
+                                "Missing trigger price while replacing conditional order for %s.",
+                                trade.pair,
+                            )
                     succeeded = self.execute_entry(
                         pair=trade.pair,
                         stake_amount=(
