@@ -5,6 +5,7 @@ Provides pair list fetched from a remote source
 """
 
 import logging
+import glob
 from pathlib import Path
 from typing import Any
 
@@ -37,11 +38,8 @@ class RemotePairList(IPairList):
                 'for "pairlist.config.number_assets"'
             )
 
-        if "pairlist_url" not in self._pairlistconfig:
-            raise OperationalException(
-                "`pairlist_url` not specified. Please check your configuration "
-                'for "pairlist.config.pairlist_url"'
-            )
+        self._pairlist_urls = self._parse_pairlist_urls()
+        self._pairlist_url = self._pairlist_urls[0]
 
         self._mode = self._pairlistconfig.get("mode", "whitelist")
         self._processing_mode = self._pairlistconfig.get("processing_mode", "filter")
@@ -49,7 +47,6 @@ class RemotePairList(IPairList):
         self._refresh_period: int = self._pairlistconfig.get("refresh_period", 1800)
         self._keep_pairlist_on_failure = self._pairlistconfig.get("keep_pairlist_on_failure", True)
         self._pair_cache: TTLCache = TTLCache(maxsize=1, ttl=self._refresh_period)
-        self._pairlist_url = self._pairlistconfig.get("pairlist_url", "")
         self._read_timeout = self._pairlistconfig.get("read_timeout", 60)
         self._bearer_token = self._pairlistconfig.get("bearer_token", "")
         self._init_done = False
@@ -100,6 +97,12 @@ class RemotePairList(IPairList):
                 "description": "URL to fetch pairlist from",
                 "help": "URL to fetch pairlist from",
             },
+            "pairlist_urls": {
+                "type": "list",
+                "default": [],
+                "description": "List of URLs to fetch pairlist data from",
+                "help": "Each URL should return pairlist JSON. Remote and local file URLs supported.",
+            },
             "number_assets": {
                 "type": "number",
                 "default": 30,
@@ -147,6 +150,33 @@ class RemotePairList(IPairList):
             },
         }
 
+    def _parse_pairlist_urls(self) -> list[str]:
+        single_url = self._pairlistconfig.get("pairlist_url", "")
+        configured_urls = self._pairlistconfig.get("pairlist_urls", [])
+        urls: list[str] = []
+
+        if single_url:
+            urls.append(single_url)
+
+        if configured_urls:
+            if isinstance(configured_urls, str):
+                configured_urls = [configured_urls]
+            elif not isinstance(configured_urls, list):
+                raise OperationalException("`pairlist_urls` must be a list of strings.")
+
+            for url in configured_urls:
+                if not isinstance(url, str):
+                    raise OperationalException("Each entry in `pairlist_urls` must be a string.")
+            urls.extend(configured_urls)
+
+        if not urls:
+            raise OperationalException(
+                "`pairlist_url` or `pairlist_urls` not specified. Please check your configuration "
+                'for "pairlist.config.pairlist_url(s)"'
+            )
+
+        return urls
+
     def process_json(self, jsonparse) -> list[str]:
         pairlist = jsonparse.get("pairs", [])
         remote_refresh_period = int(jsonparse.get("refresh_period", self._refresh_period))
@@ -174,14 +204,15 @@ class RemotePairList(IPairList):
 
         return pairlist
 
-    def fetch_pairlist(self) -> tuple[list[str], float]:
+    def fetch_pairlist(self, pairlist_url: str | None = None) -> tuple[list[str], float]:
+        url = pairlist_url or self._pairlist_urls[0]
         headers = {"User-Agent": "Freqtrade/" + __version__ + " Remotepairlist"}
 
         if self._bearer_token:
             headers["Authorization"] = f"Bearer {self._bearer_token}"
 
         try:
-            response = requests.get(self._pairlist_url, headers=headers, timeout=self._read_timeout)
+            response = requests.get(url, headers=headers, timeout=self._read_timeout)
             content_type = response.headers.get("content-type")
             time_elapsed = response.elapsed.total_seconds()
 
@@ -191,16 +222,16 @@ class RemotePairList(IPairList):
                 try:
                     pairlist = self.process_json(jsonparse)
                 except Exception as e:
-                    pairlist = self._handle_error(f"Failed processing JSON data: {type(e)}")
+                    pairlist = self._handle_error(
+                        f"Failed processing JSON data from {url}: {type(e)}"
+                    )
             else:
                 pairlist = self._handle_error(
-                    f"RemotePairList is not of type JSON. {self._pairlist_url}"
+                    f"RemotePairList is not of type JSON. {url}"
                 )
 
         except requests.exceptions.RequestException:
-            pairlist = self._handle_error(
-                f"Was not able to fetch pairlist from: {self._pairlist_url}"
-            )
+            pairlist = self._handle_error(f"Was not able to fetch pairlist from: {url}")
 
             time_elapsed = 0
 
@@ -234,30 +265,23 @@ class RemotePairList(IPairList):
             # Item found - no refresh necessary
             return pairlist.copy()
         else:
-            if self._pairlist_url.startswith("file:///"):
-                filename = self._pairlist_url.split("file:///", 1)[1]
-                file_path = Path(filename)
-
-                if file_path.exists():
-                    with file_path.open() as json_file:
-                        try:
-                            # Load the JSON data into a dictionary
-                            jsonparse = rapidjson.load(json_file, parse_mode=CONFIG_PARSE_MODE)
-                            pairlist = self.process_json(jsonparse)
-                        except Exception as e:
-                            pairlist = self._handle_error(f"processing JSON data: {type(e)}")
+            aggregated_pairs: list[str] = []
+            for pairlist_url in self._pairlist_urls:
+                if pairlist_url.startswith("file:///"):
+                    aggregated_pairs.extend(self._load_pairlist_from_file_url(pairlist_url))
                 else:
-                    pairlist = self._handle_error(f"{self._pairlist_url} does not exist.")
-
-            else:
-                # Fetch Pairlist from Remote URL
-                pairlist, time_elapsed = self.fetch_pairlist()
+                    fetched_pairs, elapsed = self.fetch_pairlist(pairlist_url)
+                    aggregated_pairs.extend(fetched_pairs)
+                    time_elapsed += elapsed
+            pairlist = aggregated_pairs
 
         self.log_once(f"Fetched pairs: {pairlist}", logger.debug)
 
         pairlist = self._exchange.normalize_pairs(pairlist)
+        pairlist = self._deduplicate_pairs(pairlist)
         pairlist = expand_pairlist(pairlist, list(self._exchange.get_markets().keys()))
         pairlist = self._whitelist_for_active_markets(pairlist)
+        pairlist = self._deduplicate_pairs(pairlist)
         pairlist = pairlist[: self._number_pairs]
 
         if pairlist:
@@ -277,6 +301,47 @@ class RemotePairList(IPairList):
             self.save_pairlist(pairlist, self._save_to_file)
 
         return pairlist
+
+    def _load_pairlist_from_file_url(self, pairlist_url: str) -> list[str]:
+        filename = pairlist_url.split("file:///", 1)[1]
+        file_paths = self._expand_file_pattern(filename)
+
+        if not file_paths:
+            return self._handle_error(f"{pairlist_url} does not exist.")
+
+        aggregated_pairs: list[str] = []
+        for file_path in file_paths:
+            if not file_path.exists():
+                continue
+            with file_path.open() as json_file:
+                try:
+                    jsonparse = rapidjson.load(json_file, parse_mode=CONFIG_PARSE_MODE)
+                    aggregated_pairs.extend(self.process_json(jsonparse))
+                except Exception as e:
+                    return self._handle_error(
+                        f"processing JSON data from {file_path}: {type(e)}"
+                    )
+        return aggregated_pairs
+
+    def _expand_file_pattern(self, pattern: str) -> list[Path]:
+        expanded_pattern = str(Path(pattern).expanduser())
+        matches = glob.glob(expanded_pattern)
+
+        if not matches and ".*" in expanded_pattern:
+            regex_like_pattern = expanded_pattern.replace(".*", "*")
+            matches = glob.glob(regex_like_pattern)
+
+        return [Path(match) for match in matches]
+
+    @staticmethod
+    def _deduplicate_pairs(pairs: list[str]) -> list[str]:
+        seen = set()
+        deduplicated: list[str] = []
+        for pair in pairs:
+            if pair not in seen:
+                seen.add(pair)
+                deduplicated.append(pair)
+        return deduplicated
 
     def save_pairlist(self, pairlist: list[str], filename: str) -> None:
         pairlist_data = {"pairs": pairlist}

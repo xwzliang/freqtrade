@@ -23,16 +23,9 @@ def rpl_config(default_conf):
     return default_conf
 
 
-def test_gen_pairlist_with_local_file(mocker, rpl_config):
-    mock_file = MagicMock()
-    mock_file.read.return_value = '{"pairs": ["TKN/USDT","ETH/USDT","NANO/USDT"]}'
-    mocker.patch("freqtrade.plugins.pairlist.RemotePairList.open", return_value=mock_file)
-
-    mock_file_path = mocker.patch("freqtrade.plugins.pairlist.RemotePairList.Path")
-    mock_file_path.exists.return_value = True
-
-    jsonparse = json.loads(mock_file.read.return_value)
-    mocker.patch("freqtrade.plugins.pairlist.RemotePairList.rapidjson.load", return_value=jsonparse)
+def test_gen_pairlist_with_local_file(mocker, rpl_config, tmp_path):
+    file_path = tmp_path / "pairlist.json"
+    file_path.write_text(json.dumps({"pairs": ["TKN/USDT", "ETH/USDT", "NANO/USDT"]}))
 
     rpl_config["pairlists"] = [
         {
@@ -40,7 +33,7 @@ def test_gen_pairlist_with_local_file(mocker, rpl_config):
             "number_assets": 2,
             "refresh_period": 1800,
             "keep_pairlist_on_failure": True,
-            "pairlist_url": "file:///pairlist.json",
+            "pairlist_url": f"file:////{file_path.as_posix().lstrip('/')}",
             "bearer_token": "",
             "read_timeout": 60,
         }
@@ -56,6 +49,39 @@ def test_gen_pairlist_with_local_file(mocker, rpl_config):
     result = remote_pairlist.gen_pairlist([])
 
     assert result == ["TKN/USDT", "ETH/USDT"]
+
+
+def test_gen_pairlist_with_local_file_glob(mocker, rpl_config, tmp_path):
+    pairlist_dir = tmp_path / "pairlists"
+    pairlist_dir.mkdir()
+
+    (pairlist_dir / "consumer_a.json").write_text(
+        json.dumps({"pairs": ["TKN/USDT", "ETH/USDT"]})
+    )
+    (pairlist_dir / "consumer_b.json").write_text(
+        json.dumps({"pairs": ["ETH/USDT", "XRP/USDT"]})
+    )
+
+    rpl_config["pairlists"] = [
+        {
+            "method": "RemotePairList",
+            "number_assets": 10,
+            "refresh_period": 1800,
+            "keep_pairlist_on_failure": True,
+            "pairlist_url": f"file:////{pairlist_dir.as_posix().lstrip('/')}/consumer_.*.json",
+        }
+    ]
+
+    exchange = get_patched_exchange(mocker, rpl_config)
+    pairlistmanager = PairListManager(exchange, rpl_config)
+
+    remote_pairlist = RemotePairList(
+        exchange, pairlistmanager, rpl_config, rpl_config["pairlists"][0], 0
+    )
+
+    result = remote_pairlist.gen_pairlist([])
+
+    assert result == ["TKN/USDT", "ETH/USDT", "XRP/USDT"]
 
 
 def test_fetch_pairlist_mock_response_html(mocker, rpl_config):
@@ -131,8 +157,8 @@ def test_remote_pairlist_init_no_pairlist_url(mocker, rpl_config):
     get_patched_exchange(mocker, rpl_config)
     with pytest.raises(
         OperationalException,
-        match=r"`pairlist_url` not specified."
-        r' Please check your configuration for "pairlist.config.pairlist_url"',
+        match=r"`pairlist_url` or `pairlist_urls` not specified."
+        r' Please check your configuration for "pairlist\.config\.pairlist_url\(s\)"',
     ):
         get_patched_freqtradebot(mocker, rpl_config)
 
@@ -192,6 +218,42 @@ def test_fetch_pairlist_mock_response_valid(mocker, rpl_config):
     assert pairs == ["ETH/USDT", "XRP/USDT", "LTC/USDT", "EOS/USDT"]
     assert time_elapsed == 0.4
     assert remote_pairlist._refresh_period == 60
+
+
+def test_remote_pairlist_aggregates_multiple_urls(mocker, rpl_config):
+    responses = []
+    for result in [
+        {"pairs": ["ETH/USDT", "XRP/USDT"], "refresh_period": 60},
+        {"pairs": ["XRP/USDT", "LTC/USDT"], "refresh_period": 60},
+    ]:
+        mock_response = MagicMock()
+        mock_response.json.return_value = result
+        mock_response.headers = {"content-type": "application/json"}
+        mock_response.elapsed.total_seconds.return_value = 0.2
+        responses.append(mock_response)
+
+    rpl_config["pairlists"] = [
+        {
+            "method": "RemotePairList",
+            "pairlist_urls": ["http://example.com/first", "http://example.com/second"],
+            "number_assets": 10,
+        }
+    ]
+
+    mocker.patch(
+        "freqtrade.plugins.pairlist.RemotePairList.requests.get",
+        side_effect=responses,
+    )
+
+    exchange = get_patched_exchange(mocker, rpl_config)
+    pairlistmanager = PairListManager(exchange, rpl_config)
+    remote_pairlist = RemotePairList(
+        exchange, pairlistmanager, rpl_config, rpl_config["pairlists"][0], 0
+    )
+
+    result = remote_pairlist.gen_pairlist([])
+
+    assert result == ["ETH/USDT", "XRP/USDT", "LTC/USDT"]
 
 
 def test_remote_pairlist_init_wrong_mode(mocker, rpl_config):
