@@ -1152,6 +1152,29 @@ if self.config['runmode'].value in ('live', 'dry_run'):
         self.lock_pair(metadata['pair'], until=datetime.now(timezone.utc) + timedelta(hours=12))
 ```
 
+## Identify outdated or empty pair data
+
+When you need to react to pairs whose candles stopped updating (e.g. a delisted pair or a temporary data outage),
+use `self.get_outdated_pairs()`. The helper returns a dictionary with pairs as keys and their age in minutes as
+values. You can optionally pass a `threshold_minutes` argument, or configure a default threshold via
+`outdated_history_threshold_minutes` in your config file (defaults to 15 minutes if omitted).
+
+Similarly, `self.get_empty_pairs()` lists pairs that recently returned empty OHLCV data. This can help you
+lock or remove pairs where the exchange stopped serving candles entirely. It accepts the same optional
+`threshold_minutes` parameter and can default to `empty_history_threshold_minutes` from your config.
+
+```python
+def bot_loop_start(self, current_time: datetime, **kwargs):
+    stale_pairs = self.get_outdated_pairs(threshold_minutes=20)
+    empty_pairs = self.get_empty_pairs()  # uses config/default threshold
+    for pair, age in stale_pairs.items():
+        logger.warning("Locking %s because data is %s minutes old", pair, age)
+        self.lock_pair(pair, until=current_time + timedelta(hours=1), reason="stale-data")
+    for pair, age in empty_pairs.items():
+        # Example: remove the pair from whitelist or notify via RPC
+        logger.error("%s has been empty for %s minutes", pair, age)
+```
+
 ## Print the main dataframe
 
 To inspect the current main dataframe, you can issue a print-statement in either `populate_entry_trend()` or `populate_exit_trend()`.

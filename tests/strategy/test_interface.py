@@ -197,6 +197,124 @@ def test_get_signal_no_sell_column(default_conf, mocker, caplog, ohlcv_history):
     )
 
 
+def test_get_outdated_pairs_threshold(monkeypatch):
+    fake_now = datetime(2021, 1, 1, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("freqtrade.strategy.interface.dt_now", lambda: fake_now)
+
+    strategy = StrategyTestV3(config={})
+    strategy._IStrategy__last_candle_seen_per_pair = {  # type: ignore[attr-defined]
+        "ETH/BTC": fake_now - timedelta(minutes=30),
+        "XRP/USDT": fake_now - timedelta(minutes=12),
+        "DOGE/USDT": None,
+    }
+
+    assert strategy.get_outdated_pairs(threshold_minutes=15) == {"ETH/BTC": 30}
+
+
+def test_get_outdated_pairs_config_threshold(monkeypatch):
+    fake_now = datetime(2021, 1, 1, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("freqtrade.strategy.interface.dt_now", lambda: fake_now)
+
+    strategy = StrategyTestV3(config={"outdated_history_threshold_minutes": 20})
+    strategy._IStrategy__last_candle_seen_per_pair = {  # type: ignore[attr-defined]
+        "ETH/BTC": fake_now - timedelta(minutes=40),
+        "XRP/USDT": fake_now - timedelta(minutes=19),
+    }
+
+    assert strategy.get_outdated_pairs() == {"ETH/BTC": 40}
+
+
+def test_get_outdated_pairs_invalid_threshold():
+    strategy = StrategyTestV3(config={})
+
+    with pytest.raises(StrategyError, match="Outdated History threshold must be 1 minute or higher"):
+        strategy.get_outdated_pairs(threshold_minutes=0)
+
+    with pytest.raises(StrategyError, match="Invalid value used for outdated history threshold"):
+        strategy.get_outdated_pairs(threshold_minutes="foo")  # type: ignore[arg-type]
+
+
+def test_get_empty_pairs_threshold(monkeypatch):
+    fake_now = datetime(2021, 1, 1, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("freqtrade.strategy.interface.dt_now", lambda: fake_now)
+
+    strategy = StrategyTestV3(config={})
+    strategy._IStrategy__last_empty_candle_seen_per_pair = {  # type: ignore[attr-defined]
+        "ETH/BTC": fake_now - timedelta(minutes=45),
+        "XRP/USDT": fake_now - timedelta(minutes=5),
+    }
+
+    assert strategy.get_empty_pairs(threshold_minutes=15) == {"ETH/BTC": 45}
+
+
+def test_get_empty_pairs_config_threshold(monkeypatch):
+    fake_now = datetime(2021, 1, 1, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("freqtrade.strategy.interface.dt_now", lambda: fake_now)
+
+    strategy = StrategyTestV3(config={"empty_history_threshold_minutes": 10})
+    strategy._IStrategy__last_empty_candle_seen_per_pair = {  # type: ignore[attr-defined]
+        "ETH/BTC": fake_now - timedelta(minutes=20),
+        "XRP/USDT": fake_now - timedelta(minutes=9),
+    }
+
+    assert strategy.get_empty_pairs() == {"ETH/BTC": 20}
+
+
+def test_get_empty_pairs_invalid_threshold():
+    strategy = StrategyTestV3(config={})
+
+    with pytest.raises(StrategyError, match="Empty History threshold must be 1 minute or higher"):
+        strategy.get_empty_pairs(threshold_minutes=0)
+
+    with pytest.raises(StrategyError, match="Invalid value used for empty history threshold"):
+        strategy.get_empty_pairs(threshold_minutes="foo")  # type: ignore[arg-type]
+
+
+def test_get_latest_candle_marks_empty(monkeypatch, default_conf):
+    times = {"value": datetime(2021, 1, 1, 12, 0, tzinfo=UTC)}
+
+    def fake_now() -> datetime:
+        return times["value"]
+
+    monkeypatch.setattr("freqtrade.strategy.interface.dt_now", fake_now)
+
+    strategy = StrategyTestV3(config={})
+    strategy.get_latest_candle("ETH/BTC", default_conf["timeframe"], DataFrame())
+
+    times["value"] = times["value"] + timedelta(minutes=2)
+
+    assert strategy.get_empty_pairs(threshold_minutes=1) == {"ETH/BTC": 2}
+
+
+def test_empty_pair_timestamp_not_reset(monkeypatch, default_conf):
+    times = {"value": datetime(2021, 1, 1, 12, 0, tzinfo=UTC)}
+
+    def fake_now() -> datetime:
+        return times["value"]
+
+    monkeypatch.setattr("freqtrade.strategy.interface.dt_now", fake_now)
+
+    strategy = StrategyTestV3(config={})
+    strategy.get_latest_candle("ETH/BTC", default_conf["timeframe"], DataFrame())
+    first_mark = strategy._IStrategy__last_empty_candle_seen_per_pair[  # type: ignore[attr-defined]
+        "ETH/BTC"
+    ]
+
+    times["value"] = times["value"] + timedelta(seconds=30)
+    strategy.get_latest_candle("ETH/BTC", default_conf["timeframe"], DataFrame())
+
+    assert (
+        strategy._IStrategy__last_empty_candle_seen_per_pair[  # type: ignore[attr-defined]
+            "ETH/BTC"
+        ]
+        == first_mark
+    )
+
+    times["value"] = times["value"] + timedelta(minutes=5)
+
+    assert strategy.get_empty_pairs(threshold_minutes=5) == {"ETH/BTC": 5}
+
+
 def test_ignore_expired_candle(default_conf):
     strategy = StrategyResolver.load_strategy(default_conf)
     strategy.ignore_buying_expired_candle_after = 60

@@ -47,6 +47,8 @@ from freqtrade.wallets import Wallets
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_OUTDATED_HISTORY_THRESHOLD_MINUTES = 15
+DEFAULT_EMPTY_HISTORY_THRESHOLD_MINUTES = 15
 
 class IStrategy(ABC, HyperStrategyMixin):
     """
@@ -157,6 +159,7 @@ class IStrategy(ABC, HyperStrategyMixin):
         self.config = config
         # Dict to determine if analysis is necessary
         self.__last_candle_seen_per_pair: dict[str, datetime] = {}
+        self.__last_empty_candle_seen_per_pair: dict[str, datetime] = {}
         super().__init__(config)
 
         # Gather informative pairs from @informative-decorated methods.
@@ -1212,6 +1215,108 @@ class IStrategy(ABC, HyperStrategyMixin):
             lock_time = timeframe_to_next_date(self.timeframe, candle_date)
             return PairLocks.is_pair_locked(pair, lock_time, side=side)
 
+    def get_outdated_pairs(self, threshold_minutes: int | None = None) -> dict[str, int]:
+        """
+        Return a mapping of pairs whose last analyzed candle is older than the provided threshold.
+        :param threshold_minutes: Age threshold in minutes. If not provided, falls back to the
+            config value `outdated_history_threshold_minutes` or 15 minutes.
+        :return: Dict with pair names as keys and their age (in minutes) as values.
+        """
+
+        threshold_value = self._resolve_threshold_minutes(
+            threshold_minutes,
+            "outdated_history_threshold_minutes",
+            DEFAULT_OUTDATED_HISTORY_THRESHOLD_MINUTES,
+            "outdated history",
+        )
+
+        now_dt = dt_now()
+        outdated_pairs: dict[str, int] = {}
+        for pair, last_seen in self.__last_candle_seen_per_pair.items():
+            last_seen_dt = self._normalize_candle_timestamp(last_seen)
+            if last_seen_dt is None:
+                continue
+            age_minutes = int((now_dt - last_seen_dt).total_seconds() // 60)
+            if age_minutes >= threshold_value:
+                outdated_pairs[pair] = age_minutes
+
+        return outdated_pairs
+
+    def get_empty_pairs(self, threshold_minutes: int | None = None) -> dict[str, int]:
+        """
+        Return a mapping of pairs that have recently returned empty OHLCV data.
+        :param threshold_minutes: Threshold in minutes to consider pairs stale. Falls back to config
+            key `empty_history_threshold_minutes` or 15 minutes when omitted.
+        :return: Dict with pair names as keys and the number of minutes since the last empty
+            candle was detected.
+        """
+
+        threshold_value = self._resolve_threshold_minutes(
+            threshold_minutes,
+            "empty_history_threshold_minutes",
+            DEFAULT_EMPTY_HISTORY_THRESHOLD_MINUTES,
+            "empty history",
+        )
+
+        now_dt = dt_now()
+        empty_pairs: dict[str, int] = {}
+        for pair, last_seen in self.__last_empty_candle_seen_per_pair.items():
+            if last_seen is None:
+                continue
+            age_minutes = int((now_dt - last_seen).total_seconds() // 60)
+            if age_minutes >= threshold_value:
+                empty_pairs[pair] = age_minutes
+
+        return empty_pairs
+
+    def _resolve_threshold_minutes(
+        self,
+        threshold_minutes: int | None,
+        config_key: str,
+        default_value: int,
+        context: str,
+    ) -> int:
+        resolved_threshold = threshold_minutes
+        if resolved_threshold is None:
+            resolved_threshold = self.config.get(config_key)
+        resolved_threshold = default_value if resolved_threshold is None else resolved_threshold
+
+        try:
+            threshold_value = int(resolved_threshold)
+        except (TypeError, ValueError) as exc:
+            raise StrategyError(
+                f"Invalid value used for {context} threshold. "
+                "Please provide an integer number of minutes."
+            ) from exc
+
+        if threshold_value < 1:
+            raise StrategyError(f"{context.title()} threshold must be 1 minute or higher.")
+
+        return threshold_value
+
+    @staticmethod
+    def _normalize_candle_timestamp(last_seen: datetime | None) -> datetime | None:
+        if last_seen is None:
+            return None
+
+        if hasattr(last_seen, "to_pydatetime"):
+            last_seen = last_seen.to_pydatetime()
+
+        if not isinstance(last_seen, datetime):
+            return None
+
+        if last_seen.tzinfo is None:
+            return last_seen.replace(tzinfo=UTC)
+
+        return last_seen.astimezone(UTC)
+
+    def _mark_pair_empty(self, pair: str) -> None:
+        # Keep the first timestamp to measure how long the pair has been empty.
+        self.__last_empty_candle_seen_per_pair.setdefault(pair, dt_now())
+
+    def _clear_pair_empty(self, pair: str) -> None:
+        self.__last_empty_candle_seen_per_pair.pop(pair, None)
+
     def analyze_ticker(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
         Parses the given candle (OHLCV) data and returns a populated DataFrame
@@ -1271,8 +1376,11 @@ class IStrategy(ABC, HyperStrategyMixin):
             pair, self.timeframe, candle_type=self.config.get("candle_type_def", CandleType.SPOT)
         )
         if not isinstance(dataframe, DataFrame) or dataframe.empty:
+            self._mark_pair_empty(pair)
             logger.warning("Empty candle (OHLCV) data for pair %s", pair)
             return
+
+        self._clear_pair_empty(pair)
 
         try:
             validator = StrategyResultValidator(
@@ -1316,8 +1424,11 @@ class IStrategy(ABC, HyperStrategyMixin):
         :return: (None, None) or (Dataframe, latest_date) - corresponding to the last candle
         """
         if not isinstance(dataframe, DataFrame) or dataframe.empty:
+            self._mark_pair_empty(pair)
             logger.warning(f"Empty candle (OHLCV) data for pair {pair}")
             return None, None
+
+        self._clear_pair_empty(pair)
 
         try:
             latest_date_pd = dataframe["date"].max()

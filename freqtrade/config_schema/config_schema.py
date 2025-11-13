@@ -181,6 +181,24 @@ CONF_SCHEMA = {
             "description": f"Ignore buying after candle expiration time. {__IN_STRATEGY}",
             "type": "number",
         },
+        "outdated_history_threshold_minutes": {
+            "description": (
+                "Threshold in minutes after which strategies can consider a pair's data outdated "
+                "when calling `get_outdated_pairs()`. "
+                f"{__IN_STRATEGY}"
+            ),
+            "type": "integer",
+            "minimum": 1,
+        },
+        "empty_history_threshold_minutes": {
+            "description": (
+                "Threshold in minutes after which strategies can consider a pair's data empty "
+                "when calling `get_empty_pairs()`. "
+                f"{__IN_STRATEGY}"
+            ),
+            "type": "integer",
+            "minimum": 1,
+        },
         "trading_mode": {
             "description": "Mode of trading (e.g., spot, margin).",
             "type": "string",

@@ -22,6 +22,8 @@
     "exit_profit_offset": 0.0,
     "ignore_roi_if_entry_signal": false,
     "ignore_buying_expired_candle_after": 300,
+    "outdated_history_threshold_minutes": 15,
+    "empty_history_threshold_minutes": 15,
     "trading_mode": "spot",
     "margin_mode": "",
     "minimal_roi": {

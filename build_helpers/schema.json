@@ -204,6 +204,16 @@
       "description": "Ignore buying after candle expiration time. \nUsually specified in the strategy and missing in the configuration.",
       "type": "number"
     },
+    "outdated_history_threshold_minutes": {
+      "description": "Threshold in minutes after which strategies consider pair data outdated when calling `get_outdated_pairs()`. \nUsually specified in the strategy and missing in the configuration.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "empty_history_threshold_minutes": {
+      "description": "Threshold in minutes after which strategies consider pair data empty when calling `get_empty_pairs()`. \nUsually specified in the strategy and missing in the configuration.",
+      "type": "integer",
+      "minimum": 1
+    },
     "trading_mode": {
       "description": "Mode of trading (e.g., spot, margin).",
       "type": "string",
