@@ -86,6 +86,7 @@ class IStrategy(ABC, HyperStrategyMixin):
     use_custom_conditional_orders: bool = False
     conditional_order_market_fallback: bool = False
     conditional_order_cancel_grace_minutes: int = 0
+    conditional_order_log_info: bool = False
 
     # Can this strategy go short?
     can_short: bool = False

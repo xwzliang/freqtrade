@@ -31,7 +31,7 @@ from freqtrade.exceptions import (
     PricingError,
     TemporaryError,
 )
-from freqtrade.freqtradebot import FreqtradeBot
+from freqtrade.freqtradebot import ConditionalOrderInstruction, FreqtradeBot
 from freqtrade.persistence import Order, PairLocks, Trade
 from freqtrade.plugins.protections.iprotection import ProtectionReturn
 from freqtrade.util.datetime_helpers import dt_now, dt_utc
@@ -1218,7 +1218,7 @@ def test_create_trade_conditional_order(mocker, default_conf_usdt) -> None:
 
 
 @pytest.mark.usefixtures("init_persistence")
-def test_create_trade_conditional_order_blocked_by_triggered(mocker, default_conf_usdt) -> None:
+def test_create_trade_conditional_order_not_blocked_by_other_pair(mocker, default_conf_usdt) -> None:
     freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
     freqtrade.strategy.custom_conditional_orders = MagicMock(
         return_value=(SignalDirection.LONG, 110.0)
@@ -1260,9 +1260,110 @@ def test_create_trade_conditional_order_blocked_by_triggered(mocker, default_con
     Trade.session.add(triggered_trade)
     Trade.commit()
 
-    assert not freqtrade.create_trade("SOL/USDT")
-    place_mock.assert_not_called()
+    assert freqtrade.create_trade("SOL/USDT")
+    place_mock.assert_called_once()
 
+
+@pytest.mark.usefixtures("init_persistence")
+def test_create_trade_conditional_order_blocked_same_pair_logs(
+    mocker, default_conf_usdt, caplog
+) -> None:
+    freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
+    freqtrade.strategy.custom_conditional_orders = MagicMock(
+        return_value=(SignalDirection.LONG, 110.0)
+    )
+    mocker.patch(f"{EXMS}.get_rate", MagicMock(return_value=100.0))
+
+    triggered_trade = Trade(
+        pair="SOL/USDT",
+        stake_amount=10.0,
+        fee_open=0.0,
+        fee_close=0.0,
+        is_open=True,
+        amount=1.0,
+        open_rate=100.0,
+        exchange="binance",
+        open_date=dt_now(),
+        is_short=False,
+        enter_tag="conditional_long",
+    )
+    filled_order = Order.parse_from_ccxt_object(
+        {
+            "id": "cond_filled",
+            "status": "closed",
+            "type": "conditional",
+            "side": "buy",
+            "amount": 1.0,
+            "filled": 1.0,
+            "remaining": 0.0,
+            "price": 100.0,
+            "average": 100.0,
+            "cost": 100.0,
+        },
+        triggered_trade.pair,
+        triggered_trade.entry_side,
+    )
+    filled_order.ft_is_open = False
+    triggered_trade.orders.append(filled_order)
+    Trade.session.add(triggered_trade)
+    Trade.commit()
+
+    caplog.set_level(logging.DEBUG)
+    assert not freqtrade.create_trade("SOL/USDT")
+    assert log_has(
+        "Conditional order for SOL/USDT skipped: existing triggered long trade still open", caplog
+    )
+
+
+@pytest.mark.usefixtures("init_persistence")
+def test_create_trade_conditional_order_verbose_logging(
+    mocker, default_conf_usdt, caplog
+) -> None:
+    freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
+    freqtrade.strategy.custom_conditional_orders = MagicMock(
+        return_value=(SignalDirection.LONG, 110.0)
+    )
+    freqtrade.strategy.conditional_order_log_info = True
+    mocker.patch(f"{EXMS}.get_rate", MagicMock(return_value=100.0))
+
+    triggered_trade = Trade(
+        pair="SOL/USDT",
+        stake_amount=10.0,
+        fee_open=0.0,
+        fee_close=0.0,
+        is_open=True,
+        amount=1.0,
+        open_rate=100.0,
+        exchange="binance",
+        open_date=dt_now(),
+        is_short=False,
+        enter_tag="conditional_long",
+    )
+    filled_order = Order.parse_from_ccxt_object(
+        {
+            "id": "cond_filled",
+            "status": "closed",
+            "type": "conditional",
+            "side": "buy",
+            "amount": 1.0,
+            "filled": 1.0,
+            "remaining": 0.0,
+            "price": 100.0,
+            "average": 100.0,
+            "cost": 100.0,
+        },
+        triggered_trade.pair,
+        triggered_trade.entry_side,
+    )
+    filled_order.ft_is_open = False
+    triggered_trade.orders.append(filled_order)
+    Trade.session.add(triggered_trade)
+    Trade.commit()
+
+    caplog.set_level(logging.INFO)
+    assert not freqtrade.create_trade("SOL/USDT")
+    messages = [record.message for record in caplog.records if record.levelno == logging.INFO]
+    assert any("Conditional order for SOL/USDT skipped" in msg for msg in messages)
 
 @pytest.mark.usefixtures("init_persistence")
 def test_create_trade_conditional_order_updates_existing(mocker, default_conf_usdt) -> None:
@@ -1504,7 +1605,7 @@ def test_manage_open_orders_cancels_conditional_when_direction_blocked(
         return_value=(SignalDirection.LONG, 90.0)
     )
     trigger_trade = Trade(
-        pair="ADA/USDT",
+        pair="SOL/USDT",
         stake_amount=10.0,
         fee_open=0.0,
         fee_close=0.0,
@@ -1581,6 +1682,104 @@ def test_manage_open_orders_cancels_conditional_when_direction_blocked(
 
     cancel_mock.assert_called_once()
     assert cancel_mock.call_args[0][3] == CANCEL_REASON["CONDITIONAL_BLOCK"]
+
+
+@pytest.mark.usefixtures("init_persistence")
+def test_manage_open_orders_keeps_conditional_other_pair(mocker, default_conf_usdt) -> None:
+    freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
+    freqtrade.strategy.custom_conditional_orders = MagicMock(
+        return_value=(SignalDirection.LONG, 90.0)
+    )
+    trigger_trade = Trade(
+        pair="ADA/USDT",
+        stake_amount=10.0,
+        fee_open=0.0,
+        fee_close=0.0,
+        is_open=True,
+        amount=1.0,
+        open_rate=100.0,
+        exchange="binance",
+        open_date=dt_now(),
+        is_short=False,
+        enter_tag="conditional_long",
+    )
+    trigger_order = Order.parse_from_ccxt_object(
+        {
+            "id": "cond_trigger",
+            "status": "closed",
+            "type": "conditional",
+            "side": "buy",
+            "amount": 1.0,
+            "filled": 1.0,
+            "remaining": 0.0,
+            "price": 100.0,
+            "average": 100.0,
+            "cost": 100.0,
+        },
+        trigger_trade.pair,
+        trigger_trade.entry_side,
+    )
+    trigger_trade.orders.append(trigger_order)
+
+    pending_trade = Trade(
+        pair="SOL/USDT",
+        stake_amount=10.0,
+        fee_open=0.0,
+        fee_close=0.0,
+        is_open=True,
+        amount=1.0,
+        open_rate=100.0,
+        exchange="binance",
+        open_date=dt_now(),
+        is_short=False,
+        enter_tag="conditional_long",
+    )
+    pending_order_ccxt = {
+        "id": "cond_pending",
+        "status": "open",
+        "type": "conditional",
+        "side": "buy",
+        "amount": 1.0,
+        "filled": 0.0,
+        "remaining": 1.0,
+        "price": 90.0,
+        "average": None,
+        "cost": 0.0,
+        "stopPrice": 90.0,
+    }
+    pending_order = Order.parse_from_ccxt_object(
+        pending_order_ccxt,
+        pending_trade.pair,
+        pending_trade.entry_side,
+    )
+    pending_order.ft_order_tag = "conditional_long"
+    pending_order.order_type = "conditional"
+    pending_order.stop_price = 90.0
+    pending_trade.orders.append(pending_order)
+
+    Trade.session.add_all([trigger_trade, pending_trade])
+    Trade.commit()
+
+    mocker.patch.object(freqtrade, "update_trade_state", return_value=False)
+    mocker.patch(f"{EXMS}.fetch_order", MagicMock(return_value=pending_order_ccxt))
+    cancel_mock = mocker.patch.object(freqtrade, "handle_cancel_enter", return_value=True)
+
+    freqtrade.manage_open_orders()
+
+    cancel_mock.assert_not_called()
+
+
+@pytest.mark.usefixtures("init_persistence")
+def test_place_conditional_order_logs_reason_no_stake(mocker, default_conf_usdt, caplog) -> None:
+    freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
+    instruction = ConditionalOrderInstruction(direction=SignalDirection.LONG, trigger_price=1.0)
+    mocker.patch.object(freqtrade.wallets, "get_trade_stake_amount", return_value=None)
+    caplog.set_level(logging.DEBUG)
+
+    assert not freqtrade._place_conditional_order(
+        "SOL/USDT", instruction, dt_now(), allow_slot_override=True
+    )
+    assert log_has("Conditional order for SOL/USDT skipped: no stake amount available", caplog)
 
 @pytest.mark.parametrize(
     "return_value,side_effect,log_message",

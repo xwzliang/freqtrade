@@ -516,7 +516,9 @@ The callback must either return:
 Whenever the returned direction or trigger price differs from the currently open conditional order, Freqtrade cancels the existing order and places a new one with the requested trigger price. The bot persists these orders just like regular entries, so database exports, RPC output and notifications remain consistent.
 
 !!! note
-    Once a conditional order triggers and the resulting trade remains open, Freqtrade suppresses additional conditional entries in the same direction. Any outstanding conditional orders pointing in that direction are cancelled automatically and new ones will only be scheduled after the triggered trade exits.
+    Once a conditional order triggers for a pair and the resulting trade remains open, Freqtrade suppresses additional conditional entries in the same direction for that pair. Outstanding conditional orders for the pair/direction are cancelled automatically and new ones will only be scheduled after that trade exits.
+
+You can inspect why a conditional instruction did not result in a new order via the bot logs. Set `conditional_order_log_info = True` on your strategy class to emit those messages at INFO instead of DEBUG level.
 
 !!! info
     Conditional orders rely on trigger/stop functionality exposed by the exchange through ccxt. By default the bot sends the trigger price using the `triggerPrice` parameter. If your exchange requires a different parameter name you can override `_ft_has_params` for the exchange in your configuration.

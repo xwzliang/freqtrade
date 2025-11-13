@@ -773,6 +773,7 @@ class FreqtradeBot(LoggingMixin):
     ) -> bool:
         if not allow_slot_override and self.get_free_open_trades() <= 0:
             logger.debug("Max open trades reached, cannot place conditional order for %s.", pair)
+            self._log_conditional_skip(pair, "max open trades reached")
             return False
         if self.strategy.is_pair_locked(pair, candle_date=nowtime, side=instruction.direction):
             lock = PairLocks.get_pair_longest_lock(pair, nowtime, instruction.direction)
@@ -782,16 +783,18 @@ class FreqtradeBot(LoggingMixin):
                     f"{lock.lock_end_time.strftime(constants.DATETIME_PRINT_FORMAT)} "
                     f"due to {lock.reason}."
                 )
+            self._log_conditional_skip(pair, "pair is locked")
             return False
 
         stake_amount = self.wallets.get_trade_stake_amount(pair, self.config["max_open_trades"])
         if not stake_amount:
             logger.warning("No stake amount available for conditional order on %s.", pair)
+            self._log_conditional_skip(pair, "no stake amount available")
             return False
 
         fallback_enabled = getattr(self.strategy, "conditional_order_market_fallback", False)
         try:
-            return self.execute_entry(
+            placed = self.execute_entry(
                 pair=pair,
                 stake_amount=stake_amount,
                 price=instruction.trigger_price,
@@ -800,6 +803,9 @@ class FreqtradeBot(LoggingMixin):
                 enter_tag=f"conditional_{instruction.direction.value}",
                 trigger_price=instruction.trigger_price,
             )
+            if not placed:
+                self._log_conditional_skip(pair, "order execution rejected")
+            return placed
         except InvalidOrderException as exc:
             if fallback_enabled and self._should_market_fallback(exc):
                 logger.warning(
@@ -807,7 +813,7 @@ class FreqtradeBot(LoggingMixin):
                     "Executing market order instead.",
                     pair,
                 )
-                return self.execute_entry(
+                placed = self.execute_entry(
                     pair=pair,
                     stake_amount=stake_amount,
                     price=None,
@@ -815,6 +821,9 @@ class FreqtradeBot(LoggingMixin):
                     ordertype="market",
                     enter_tag=f"conditional_market_{instruction.direction.value}",
                 )
+                if not placed:
+                    self._log_conditional_skip(pair, "market fallback rejected")
+                return placed
             raise
 
     def _extract_order_trigger_price(self, order: CcxtOrder, order_obj: Order) -> float | None:
@@ -885,6 +894,7 @@ class FreqtradeBot(LoggingMixin):
         )
         desired_direction = SignalDirection.SHORT if trade.is_short else SignalDirection.LONG
         if self._conditional_direction_blocked(
+            trade.pair,
             desired_direction,
             open_trades_snapshot=open_trades_snapshot,
             ignore_trade_id=trade.id,
@@ -1044,6 +1054,7 @@ class FreqtradeBot(LoggingMixin):
 
     def _conditional_direction_blocked(
         self,
+        pair: str,
         direction: SignalDirection,
         *,
         open_trades_snapshot: Sequence[Trade] | None = None,
@@ -1055,6 +1066,8 @@ class FreqtradeBot(LoggingMixin):
         """
         trades = open_trades_snapshot if open_trades_snapshot is not None else Trade.get_open_trades()
         for open_trade in trades:
+            if open_trade.pair != pair:
+                continue
             if ignore_trade_id is not None and open_trade.id == ignore_trade_id:
                 continue
             if not self._trade_is_triggered_conditional(open_trade):
@@ -1063,6 +1076,11 @@ class FreqtradeBot(LoggingMixin):
             if active_direction == direction:
                 return True
         return False
+
+    def _log_conditional_skip(self, pair: str, reason: str) -> None:
+        log_info = getattr(self.strategy, "conditional_order_log_info", False)
+        log_fn = logger.info if log_info else logger.debug
+        log_fn("Conditional order for %s skipped: %s", pair, reason)
 
     def _can_bypass_conditional_slot_limit(
         self, pair: str, instruction: ConditionalOrderInstruction
@@ -1224,11 +1242,10 @@ class FreqtradeBot(LoggingMixin):
                 pair, stake_amount, enter_tag=enter_tag, is_short=(signal == SignalDirection.SHORT)
             )
         elif cond_instruction:
-            if self._conditional_direction_blocked(cond_instruction.direction):
-                logger.debug(
-                    "Skipping conditional order for %s - %s conditional entry already active.",
+            if self._conditional_direction_blocked(pair, cond_instruction.direction):
+                self._log_conditional_skip(
                     pair,
-                    cond_instruction.direction.value,
+                    f"existing triggered {cond_instruction.direction.value} trade still open",
                 )
                 return False
             if self.exchange.hedge_mode and self._update_existing_conditional_order(
@@ -1239,9 +1256,7 @@ class FreqtradeBot(LoggingMixin):
             if free_open_trades <= 0:
                 allow_slot_override = self._can_bypass_conditional_slot_limit(pair, cond_instruction)
                 if not allow_slot_override:
-                    logger.debug(
-                        "Max open trades reached, cannot place conditional order for %s.", pair
-                    )
+                    self._log_conditional_skip(pair, "max open trades reached")
                     return False
             return self._place_conditional_order(
                 pair, cond_instruction, nowtime, allow_slot_override=allow_slot_override
