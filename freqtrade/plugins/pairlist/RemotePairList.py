@@ -315,7 +315,11 @@ class RemotePairList(IPairList):
                 continue
             with file_path.open() as json_file:
                 try:
-                    jsonparse = rapidjson.load(json_file, parse_mode=CONFIG_PARSE_MODE)
+                    file_content = json_file.read().strip()
+                    if not file_content:
+                        self.log_once(f"Ignoring empty pairlist file {file_path}", logger.warning)
+                        continue
+                    jsonparse = rapidjson.loads(file_content, parse_mode=CONFIG_PARSE_MODE)
                     aggregated_pairs.extend(self.process_json(jsonparse))
                 except Exception as e:
                     return self._handle_error(
