@@ -7,7 +7,7 @@ import json
 import logging
 import time
 from collections import deque
-from datetime import UTC, datetime, timedelta, time as dt_time
+from datetime import UTC, datetime, timedelta, time as dt_time, date as dt_date
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -586,6 +586,7 @@ class Tushare(Exchange):
 
         key = (pair, timeframe, candle_type)
         cached_df_full = self._klines.get(key)
+        last_cached_market_date: dt_date | None = None
         if cached_df_full is not None and not cached_df_full.empty:
             last_cached_dt = cached_df_full.iloc[-1]["date"]
             if isinstance(last_cached_dt, datetime):
@@ -594,16 +595,26 @@ class Tushare(Exchange):
                     if last_cached_dt.tzinfo
                     else last_cached_dt.replace(tzinfo=UTC)
                 )
+            else:
+                last_cached_dt = datetime.fromtimestamp(last_cached_dt, tz=UTC)
             last_cached_ms = int(last_cached_dt.timestamp() * 1000)
             since_ms = max((since_ms or 0), last_cached_ms + 1)
+            last_cached_market_date = last_cached_dt.astimezone(self._market_timezone).date()
 
         ts_code = pair.split("/")[0]
         start = self._ms_to_trade_date(since_ms)
         end = self._ms_to_trade_date(until_ms) if until_ms else None
 
+        now_market = datetime.now(self._market_timezone)
+        latest_completed_trade_date = self._latest_completed_trading_day(now_market)
+        has_missed_trading_days = (
+            last_cached_market_date is None
+            or last_cached_market_date < latest_completed_trade_date
+        )
+
         skip_until = self._no_data_until.get(pair)
         now_utc = datetime.now(UTC)
-        if skip_until and now_utc < skip_until:
+        if skip_until and now_utc < skip_until and not has_missed_trading_days:
             logger.debug(
                 "Skipping OHLCV fetch for %s until %s due to previous no-data response.",
                 pair,
@@ -611,9 +622,8 @@ class Tushare(Exchange):
             )
             return []
 
-        now_market = datetime.now(self._market_timezone)
         today_date = now_market.date()
-        if not self._is_trading_day(today_date):
+        if not self._is_trading_day(today_date) and not has_missed_trading_days:
             logger.debug(
                 "Today (%s) is not a trading day. Skipping fetch for %s.", today_date, pair
             )
@@ -621,7 +631,7 @@ class Tushare(Exchange):
             return self._get_cached_ticks(pair, timeframe, since_ms) or []
 
         close_dt_market = datetime.combine(today_date, self._market_close_time, tzinfo=self._market_timezone)
-        if now_market < close_dt_market:
+        if self._is_trading_day(today_date) and now_market < close_dt_market and not has_missed_trading_days:
             logger.debug(
                 "Market still open (closes %s). Using cached data for %s.",
                 close_dt_market,
@@ -844,6 +854,20 @@ class Tushare(Exchange):
             return day not in cal
         except TypeError:
             return day not in set(cal)
+
+    def _latest_completed_trading_day(self, now_market: datetime) -> dt_date:
+        """
+        Return the most recent trading day that should already have final OHLCV data.
+        """
+        candidate = now_market.date()
+        close_dt_market = datetime.combine(
+            candidate, self._market_close_time, tzinfo=self._market_timezone
+        )
+        if not self._is_trading_day(candidate) or now_market < close_dt_market:
+            candidate -= timedelta(days=1)
+            while not self._is_trading_day(candidate):
+                candidate -= timedelta(days=1)
+        return candidate
 
     def _call_daily_with_rate_limit(self, params: dict[str, Any]):
         """
