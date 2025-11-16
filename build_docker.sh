@@ -1,1 +1,1 @@
-docker build --progress=plain -t xwzliang/freqtrade:0.0.6 .
+docker build --progress=plain --no-cache -t xwzliang/freqtrade:0.0.6 .
