@@ -340,6 +340,140 @@ def test_ignore_expired_candle(default_conf):
     )
 
 
+def test_backlog_exit_signal_triggers(default_conf, caplog):
+    strategy = StrategyResolver.load_strategy(default_conf)
+    strategy.exit_signal_lookback_candles = 3
+
+    caplog.set_level(logging.WARNING)
+    timeframe = default_conf["timeframe"]
+    now = dt_now()
+    df = DataFrame(
+        {
+            "date": [now - timedelta(minutes=10), now - timedelta(minutes=5), now],
+            "enter_long": [0, 0, 0],
+            "exit_long": [1, 0, 0],
+            "enter_short": [0, 0, 0],
+            "exit_short": [0, 0, 0],
+            "exit_tag": ["late_exit", None, None],
+        }
+    )
+
+    enter, exit_, exit_tag = strategy.get_exit_signal("ETH/BTC", timeframe, df, is_short=False)
+    assert enter is False
+    assert exit_ is True
+    assert exit_tag == "late_exit"
+    assert log_has("Detected delayed exit signal for ETH/BTC", caplog)
+
+
+def test_backlog_exit_signal_ignored_when_new_entry_after(default_conf, caplog):
+    strategy = StrategyResolver.load_strategy(default_conf)
+    strategy.exit_signal_lookback_candles = 3
+
+    caplog.set_level(logging.WARNING)
+    timeframe = default_conf["timeframe"]
+    now = dt_now()
+    df = DataFrame(
+        {
+            "date": [now - timedelta(minutes=10), now - timedelta(minutes=5), now],
+            "enter_long": [0, 1, 0],
+            "exit_long": [1, 0, 0],
+            "enter_short": [0, 0, 0],
+            "exit_short": [0, 0, 0],
+            "exit_tag": ["late_exit", None, None],
+        }
+    )
+
+    enter, exit_, exit_tag = strategy.get_exit_signal("ETH/BTC", timeframe, df, is_short=False)
+    assert enter is False
+    assert exit_ is False
+    assert exit_tag is None
+    assert not log_has("Detected delayed exit signal for ETH/BTC", caplog)
+
+
+def test_get_latest_candle_allows_extended_stale_window(default_conf, caplog):
+    strategy = StrategyResolver.load_strategy(default_conf)
+    strategy.ignore_buying_expired_candle_after = 1800
+
+    timeframe = default_conf["timeframe"]
+    candle_date = dt_now() - timedelta(minutes=20)
+    df = DataFrame(
+        {"date": [candle_date], "open": [1], "high": [1], "low": [1], "close": [1], "volume": [1]}
+    )
+
+    caplog.set_level(logging.WARNING)
+    latest, latest_date = strategy.get_latest_candle("ETH/BTC", timeframe, df)
+
+    assert latest is not None
+    assert latest_date == candle_date
+    assert log_has("History for pair ETH/BTC is", caplog)
+
+
+def test_get_latest_candle_drops_when_past_extended_window(default_conf, caplog):
+    strategy = StrategyResolver.load_strategy(default_conf)
+    strategy.ignore_buying_expired_candle_after = 1800
+
+    timeframe = default_conf["timeframe"]
+    candle_date = dt_now() - timedelta(minutes=45)
+    df = DataFrame(
+        {"date": [candle_date], "open": [1], "high": [1], "low": [1], "close": [1], "volume": [1]}
+    )
+
+    caplog.set_level(logging.WARNING)
+    latest, latest_date = strategy.get_latest_candle("ETH/BTC", timeframe, df)
+
+    assert latest is None
+    assert latest_date is None
+    assert log_has("Outdated history for pair ETH/BTC", caplog)
+
+
+def test_backlog_entry_signal_triggers(default_conf, caplog):
+    strategy = StrategyResolver.load_strategy(default_conf)
+    strategy.enter_signal_lookback_candles = 2
+
+    caplog.set_level(logging.WARNING)
+    timeframe = default_conf["timeframe"]
+    now = dt_now()
+    df = DataFrame(
+        {
+            "date": [now - timedelta(minutes=10), now - timedelta(minutes=5), now],
+            "enter_long": [1, 0, 0],
+            "exit_long": [0, 0, 0],
+            "enter_short": [0, 0, 0],
+            "exit_short": [0, 0, 0],
+            "enter_tag": ["late_entry", None, None],
+        }
+    )
+
+    signal, tag = strategy.get_entry_signal("ETH/BTC", timeframe, df)
+    assert signal == SignalDirection.LONG
+    assert tag == "late_entry"
+    assert log_has("Detected delayed entry signal for ETH/BTC", caplog)
+
+
+def test_backlog_entry_signal_ignored_when_exit_after(default_conf, caplog):
+    strategy = StrategyResolver.load_strategy(default_conf)
+    strategy.enter_signal_lookback_candles = 3
+
+    caplog.set_level(logging.WARNING)
+    timeframe = default_conf["timeframe"]
+    now = dt_now()
+    df = DataFrame(
+        {
+            "date": [now - timedelta(minutes=10), now - timedelta(minutes=5), now],
+            "enter_long": [1, 0, 0],
+            "exit_long": [0, 1, 0],
+            "enter_short": [0, 0, 0],
+            "exit_short": [0, 0, 0],
+            "enter_tag": ["late_entry", None, None],
+        }
+    )
+
+    signal, tag = strategy.get_entry_signal("ETH/BTC", timeframe, df)
+    assert signal is None
+    assert tag is None
+    assert not log_has("Detected delayed entry signal for ETH/BTC", caplog)
+
+
 def test_assert_df_raise(mocker, caplog, ohlcv_history):
     ohlcv_history.loc[1, "date"] = dt_now() - timedelta(minutes=16)
     # Take a copy to correctly modify the call

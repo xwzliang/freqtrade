@@ -6,7 +6,7 @@ This module defines the interface to apply for strategies
 import logging
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime, timedelta
-from math import isinf, isnan
+from math import ceil, isinf, isnan
 
 from pandas import DataFrame
 from pydantic import ValidationError
@@ -125,6 +125,10 @@ class IStrategy(ABC, HyperStrategyMixin):
 
     # Number of seconds after which the candle will no longer result in a buy on expired candles
     ignore_buying_expired_candle_after: int = 0
+    # Number of candles to look back for missed exit signals in live/dry producer-consumer scenarios
+    exit_signal_lookback_candles: int = 5
+    # Number of candles to look back for missed entry signals in live/dry producer-consumer scenarios
+    enter_signal_lookback_candles: int = 2
 
     # Disable checking the dataframe (converts the error into a warning message)
     disable_dataframe_checks: bool = False
@@ -160,6 +164,11 @@ class IStrategy(ABC, HyperStrategyMixin):
         # Dict to determine if analysis is necessary
         self.__last_candle_seen_per_pair: dict[str, datetime] = {}
         self.__last_empty_candle_seen_per_pair: dict[str, datetime] = {}
+        self.__last_outdated_candle_log: dict[str, datetime] = {}
+        self.__last_outdated_grace_log: dict[str, datetime] = {}
+        self.__last_expired_signal_log: dict[str, datetime] = {}
+        self.__last_backlog_exit_log: dict[str, datetime] = {}
+        self.__last_backlog_entry_log: dict[str, datetime] = {}
         super().__init__(config)
 
         # Gather informative pairs from @informative-decorated methods.
@@ -1441,11 +1450,20 @@ class IStrategy(ABC, HyperStrategyMixin):
 
         # Check if dataframe is out of date
         timeframe_minutes = timeframe_to_minutes(timeframe)
+        timeframe_seconds = timeframe_to_seconds(timeframe)
         offset = self.config.get("exchange", {}).get("outdated_offset", 5)
         now_dt = dt_now()
         age_minutes = int((now_dt - latest_date).total_seconds() // 60)
         max_age = timeframe_minutes * 2 + offset
-        if age_minutes > max_age:
+        extended_max_age = max_age
+        if self.ignore_buying_expired_candle_after:
+            # Allow more stale candles when the user explicitly opted into using them.
+            extended_max_age = max(
+                max_age,
+                ceil((timeframe_seconds + self.ignore_buying_expired_candle_after) / 60),
+            )
+
+        if age_minutes > extended_max_age:
             if timeframe_minutes >= 1440 and (
                 now_dt.weekday() >= 5 or age_minutes <= timeframe_minutes * 3
             ):
@@ -1455,12 +1473,28 @@ class IStrategy(ABC, HyperStrategyMixin):
                     age_minutes,
                 )
                 return latest, latest_date
+            if self.__last_outdated_candle_log.get(pair) != latest_date:
+                logger.warning(
+                    "Outdated history for pair %s. Last tick is %s minutes old "
+                    "(allowed %s minutes). Dropping signals for this candle.",
+                    pair,
+                    age_minutes,
+                    extended_max_age,
+                )
+                self.__last_outdated_candle_log[pair] = latest_date
+            return None, None
+        if age_minutes > max_age and self.__last_outdated_grace_log.get(pair) != latest_date:
             logger.warning(
-                "Outdated history for pair %s. Last tick is %s minutes old",
+                "History for pair %s is %s minutes old "
+                "(default max %s minutes). Continuing because "
+                "ignore_buying_expired_candle_after=%s extends tolerance to %s minutes.",
                 pair,
                 age_minutes,
+                max_age,
+                self.ignore_buying_expired_candle_after,
+                extended_max_age,
             )
-            return None, None
+            self.__last_outdated_grace_log[pair] = latest_date
         return latest, latest_date
 
     def get_exit_signal(
@@ -1491,6 +1525,14 @@ class IStrategy(ABC, HyperStrategyMixin):
         exit_tag = latest.get(SignalTagType.EXIT_TAG.value, None)
         # Tags can be None, which does not resolve to False.
         exit_tag = exit_tag if isinstance(exit_tag, str) and exit_tag != "nan" else None
+
+        if not exit_:
+            backlog_exit, backlog_exit_tag, _exit_date = self._detect_backlog_exit_signal(
+                pair=pair, timeframe=timeframe, dataframe=dataframe, is_short=is_short or False
+            )
+            if backlog_exit:
+                exit_ = True
+                exit_tag = backlog_exit_tag
 
         logger.debug(f"exit-trigger: {latest['date']} (pair={pair}) enter={enter} exit={exit_}")
 
@@ -1538,13 +1580,25 @@ class IStrategy(ABC, HyperStrategyMixin):
 
         timeframe_seconds = timeframe_to_seconds(timeframe)
 
-        if self.ignore_expired_candle(
+        expired = self.ignore_expired_candle(
             latest_date=latest_date,
             current_time=dt_now(),
             timeframe_seconds=timeframe_seconds,
             enter=bool(enter_signal),
-        ):
-            return None, enter_tag
+            pair=pair,
+            timeframe=timeframe,
+        )
+        if expired:
+            enter_signal = None
+            enter_tag = None
+
+        if enter_signal is None:
+            backlog_enter, backlog_enter_tag, _enter_date = self._detect_backlog_entry_signal(
+                pair=pair, timeframe=timeframe, dataframe=dataframe
+            )
+            if backlog_enter is not None:
+                enter_signal = backlog_enter
+                enter_tag = backlog_enter_tag
 
         logger.debug(
             f"entry trigger: {latest['date']} (pair={pair}) "
@@ -1552,12 +1606,132 @@ class IStrategy(ABC, HyperStrategyMixin):
         )
         return enter_signal, enter_tag
 
+    def _detect_backlog_exit_signal(
+        self, pair: str, timeframe: str, dataframe: DataFrame, is_short: bool
+    ) -> tuple[bool, str | None, datetime | None]:
+        """
+        Look back a configurable number of candles to recover missed exit signals.
+        An exit is taken only if no subsequent entry of the same direction occurred after that exit
+        (to avoid acting on stale exits meant for a previous trade).
+        """
+        lookback = int(getattr(self, "exit_signal_lookback_candles", 0) or 0)
+        if lookback <= 0 or not isinstance(dataframe, DataFrame) or dataframe.empty:
+            return False, None, None
+
+        exit_col = SignalType.EXIT_SHORT.value if is_short else SignalType.EXIT_LONG.value
+        entry_col = SignalType.ENTER_SHORT.value if is_short else SignalType.ENTER_LONG.value
+        tag_col = SignalTagType.EXIT_TAG.value
+
+        subset = dataframe.tail(lookback + 1)
+        seen_entry = False
+        for row in reversed(list(subset.itertuples(index=False))):
+            date_val = getattr(row, "date", None)
+            if getattr(row, entry_col, 0) == 1:
+                seen_entry = True
+                continue
+            if getattr(row, exit_col, 0) == 1 and not seen_entry:
+                exit_tag = getattr(row, tag_col, None)
+                exit_tag = exit_tag if isinstance(exit_tag, str) and exit_tag != "nan" else None
+                if pair and date_val and self.__last_backlog_exit_log.get(pair) != date_val:
+                    logger.warning(
+                        "Detected delayed exit signal for %s on %s candle (lookback %s). "
+                        "Executing exit immediately.",
+                        pair,
+                        timeframe,
+                        lookback,
+                    )
+                    self.__last_backlog_exit_log[pair] = date_val
+                return True, exit_tag, date_val
+
+        return False, None, None
+
+    def _detect_backlog_entry_signal(
+        self, pair: str, timeframe: str, dataframe: DataFrame
+    ) -> tuple[SignalDirection | None, str | None, datetime | None]:
+        """
+        Look back a configurable number of candles to recover missed entry signals.
+        Only triggers if no newer exit of the same direction has been seen after that entry.
+        """
+        lookback = int(getattr(self, "enter_signal_lookback_candles", 0) or 0)
+        if lookback <= 0 or not isinstance(dataframe, DataFrame) or dataframe.empty:
+            return None, None, None
+
+        subset = dataframe.tail(lookback + 1)
+        seen_exit_long = False
+        seen_exit_short = False
+
+        for row in reversed(list(subset.itertuples(index=False))):
+            date_val = getattr(row, "date", None)
+            exit_long = getattr(row, SignalType.EXIT_LONG.value, 0) == 1
+            exit_short = getattr(row, SignalType.EXIT_SHORT.value, 0) == 1
+            if exit_long:
+                seen_exit_long = True
+            if exit_short:
+                seen_exit_short = True
+
+            enter_long = getattr(row, SignalType.ENTER_LONG.value, 0) == 1
+            enter_short = getattr(row, SignalType.ENTER_SHORT.value, 0) == 1
+            enter_tag = getattr(row, SignalTagType.ENTER_TAG.value, None)
+            enter_tag = enter_tag if isinstance(enter_tag, str) and enter_tag != "nan" else None
+
+            if enter_long and not seen_exit_long:
+                if pair and date_val and self.__last_backlog_entry_log.get(pair) != date_val:
+                    logger.warning(
+                        "Detected delayed entry signal for %s on %s candle (lookback %s). "
+                        "Executing entry immediately.",
+                        pair,
+                        timeframe,
+                        lookback,
+                    )
+                    self.__last_backlog_entry_log[pair] = date_val
+                return SignalDirection.LONG, enter_tag, date_val
+
+            if (
+                self.config.get("trading_mode", TradingMode.SPOT) != TradingMode.SPOT
+                and self.can_short
+                and enter_short
+                and not seen_exit_short
+            ):
+                if pair and date_val and self.__last_backlog_entry_log.get(pair) != date_val:
+                    logger.warning(
+                        "Detected delayed entry signal for %s on %s candle (lookback %s). "
+                        "Executing entry immediately.",
+                        pair,
+                        timeframe,
+                        lookback,
+                    )
+                    self.__last_backlog_entry_log[pair] = date_val
+                return SignalDirection.SHORT, enter_tag, date_val
+
+        return None, None, None
+
     def ignore_expired_candle(
-        self, latest_date: datetime, current_time: datetime, timeframe_seconds: int, enter: bool
+        self,
+        latest_date: datetime,
+        current_time: datetime,
+        timeframe_seconds: int,
+        enter: bool,
+        pair: str | None = None,
+        timeframe: str | None = None,
     ):
         if self.ignore_buying_expired_candle_after and enter:
             time_delta = current_time - (latest_date + timedelta(seconds=timeframe_seconds))
-            return time_delta.total_seconds() > self.ignore_buying_expired_candle_after
+            expired = time_delta.total_seconds() > self.ignore_buying_expired_candle_after
+            if (
+                expired
+                and pair
+                and self.__last_expired_signal_log.get(pair) != latest_date
+            ):
+                logger.warning(
+                    "Ignoring entry signal for %s on %s candle because it is %s seconds late "
+                    "(limit %s seconds).",
+                    pair,
+                    timeframe or f"{timeframe_seconds}s",
+                    int(time_delta.total_seconds()),
+                    self.ignore_buying_expired_candle_after,
+                )
+                self.__last_expired_signal_log[pair] = latest_date
+            return expired
         else:
             return False
 

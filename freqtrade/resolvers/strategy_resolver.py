@@ -41,6 +41,7 @@ class StrategyResolver(IResolver):
         :param config: configuration dictionary or None
         """
         config = config or {}
+        provided_config_keys = set(config.keys())
 
         if not config.get("strategy"):
             raise OperationalException(
@@ -79,6 +80,8 @@ class StrategyResolver(IResolver):
             ("exit_profit_offset", 0.0),
             ("disable_dataframe_checks", False),
             ("ignore_buying_expired_candle_after", 0),
+            ("exit_signal_lookback_candles", 5),
+            ("enter_signal_lookback_candles", 2),
             ("position_adjustment_enable", False),
             ("max_entry_position_adjustment", -1),
             ("max_open_trades", float("inf")),
@@ -89,7 +92,17 @@ class StrategyResolver(IResolver):
         # Loop this list again to have output combined
         for attribute, _ in attributes:
             if attribute in config:
-                logger.info(f"Strategy using {attribute}: {config[attribute]}")
+                if (
+                    attribute in {"exit_signal_lookback_candles", "enter_signal_lookback_candles"}
+                    and attribute not in provided_config_keys
+                ):
+                    logger.info(
+                        "Strategy using %s from strategy defaults: %s",
+                        attribute,
+                        config[attribute],
+                    )
+                else:
+                    logger.info(f"Strategy using {attribute}: {config[attribute]}")
 
         StrategyResolver._normalize_attributes(strategy)
 
