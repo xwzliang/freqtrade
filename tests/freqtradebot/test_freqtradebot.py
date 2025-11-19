@@ -1218,6 +1218,33 @@ def test_create_trade_conditional_order(mocker, default_conf_usdt) -> None:
 
 
 @pytest.mark.usefixtures("init_persistence")
+def test_create_trade_conditional_order_custom_tag(mocker, default_conf_usdt) -> None:
+    freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
+    freqtrade.strategy.custom_conditional_orders = MagicMock(
+        return_value=(SignalDirection.LONG, 110.0, "breakout_conditional"),
+    )
+    mocker.patch(f"{EXMS}.get_rate", MagicMock(return_value=100.0))
+    order = {
+        "id": "cond_custom",
+        "status": "open",
+        "type": "conditional",
+        "side": "buy",
+        "amount": 1.0,
+        "filled": 0.0,
+        "remaining": 1.0,
+        "price": None,
+        "average": None,
+        "cost": 0.0,
+        "stopPrice": 110.0,
+    }
+    mocker.patch(f"{EXMS}.create_order", MagicMock(return_value=order))
+
+    assert freqtrade.create_trade("ETH/USDT")
+    trade = Trade.get_open_trades()[0]
+    assert trade.enter_tag == "breakout_conditional"
+
+
+@pytest.mark.usefixtures("init_persistence")
 def test_create_trade_conditional_order_not_blocked_by_other_pair(mocker, default_conf_usdt) -> None:
     freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
     freqtrade.strategy.custom_conditional_orders = MagicMock(
@@ -1615,7 +1642,7 @@ def test_manage_open_orders_cancels_conditional_when_direction_blocked(
         exchange="binance",
         open_date=dt_now(),
         is_short=False,
-        enter_tag="conditional_long",
+        enter_tag="custom_conditional_tag",
     )
     trigger_order = Order.parse_from_ccxt_object(
         {

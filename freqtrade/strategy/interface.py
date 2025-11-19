@@ -492,9 +492,14 @@ class IStrategy(ABC, HyperStrategyMixin):
         current_rate: float,
         candle: dict | None = None,
         **kwargs,
-    ) -> tuple[SignalDirection | str, float] | None:
+    ) -> (
+        tuple[SignalDirection | str, float]
+        | tuple[SignalDirection | str, float, str | None]
+        | None
+    ):
         """
-        Return a tuple containing the direction and trigger price for a conditional entry order.
+        Return a tuple containing the direction, trigger price, and optional enter tag for a
+        conditional entry order.
         Only called when ``use_custom_conditional_orders`` is set to True.
 
         Returning ``None`` indicates that no conditional order should exist for the pair at the
@@ -506,8 +511,9 @@ class IStrategy(ABC, HyperStrategyMixin):
         :param current_rate: Current rate for the pair, following entry pricing settings.
         :param candle: The latest analyzed candle (dict-like structure) if available.
         :param **kwargs: Ensure to keep this here so updates to this won't break your strategy.
-        :return tuple[SignalDirection | str, float] | None: Direction (``long``/``short``) and the
-            trigger price that should activate the order.
+        :return tuple[SignalDirection | str, float] | tuple[SignalDirection | str, float, str | None]
+            | None: Direction (``long``/``short``), trigger price that should activate the order,
+            and an optional ``enter_tag`` that should be stored on the trade/order.
         """
         return None
 

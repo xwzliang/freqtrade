@@ -75,6 +75,7 @@ logger = logging.getLogger(__name__)
 class ConditionalOrderInstruction:
     direction: SignalDirection
     trigger_price: float
+    enter_tag: str | None = None
 
 
 @dataclass
@@ -671,12 +672,14 @@ class FreqtradeBot(LoggingMixin):
     ) -> ConditionalOrderInstruction | None:
         if value is None:
             return None
-        if not isinstance(value, (list, tuple)) or len(value) != 2:
+        if not isinstance(value, (list, tuple)) or not 2 <= len(value) <= 3:
             logger.warning(
-                "custom_conditional_orders must return a tuple of (direction, trigger_price)."
+                "custom_conditional_orders must return a tuple of"
+                " (direction, trigger_price[, enter_tag])."
             )
             return None
-        direction_raw, trigger_raw = value
+        direction_raw, trigger_raw = value[0], value[1]
+        enter_tag_raw = value[2] if len(value) == 3 else None
         direction: SignalDirection | None = None
         if isinstance(direction_raw, SignalDirection):
             direction = direction_raw
@@ -708,7 +711,19 @@ class FreqtradeBot(LoggingMixin):
         if trigger_price <= 0:
             logger.warning("custom_conditional_orders trigger price must be > 0.")
             return None
-        return ConditionalOrderInstruction(direction=direction, trigger_price=trigger_price)
+        enter_tag: str | None = None
+        if enter_tag_raw is not None:
+            if isinstance(enter_tag_raw, str):
+                enter_tag = enter_tag_raw
+            else:
+                logger.warning(
+                    "custom_conditional_orders returned an invalid enter tag for %s: %s",
+                    direction_raw,
+                    enter_tag_raw,
+                )
+        return ConditionalOrderInstruction(
+            direction=direction, trigger_price=trigger_price, enter_tag=enter_tag
+        )
 
     def _normalize_trigger_price_value(self, pair: str, price: float) -> float:
         try:
@@ -793,6 +808,7 @@ class FreqtradeBot(LoggingMixin):
             return False
 
         fallback_enabled = getattr(self.strategy, "conditional_order_market_fallback", False)
+        enter_tag = instruction.enter_tag or f"conditional_{instruction.direction.value}"
         try:
             placed = self.execute_entry(
                 pair=pair,
@@ -800,7 +816,7 @@ class FreqtradeBot(LoggingMixin):
                 price=instruction.trigger_price,
                 is_short=instruction.direction == SignalDirection.SHORT,
                 ordertype="conditional",
-                enter_tag=f"conditional_{instruction.direction.value}",
+                enter_tag=enter_tag,
                 trigger_price=instruction.trigger_price,
             )
             if not placed:
@@ -1043,7 +1059,17 @@ class FreqtradeBot(LoggingMixin):
 
     @staticmethod
     def _trade_uses_conditional_entry(trade: Trade) -> bool:
-        return isinstance(trade.enter_tag, str) and trade.enter_tag.startswith("conditional")
+        if isinstance(trade.enter_tag, str) and trade.enter_tag.startswith("conditional"):
+            return True
+        for order in trade.orders:
+            if order.ft_order_side != trade.entry_side:
+                continue
+            order_type = (order.order_type or "").lower()
+            if order_type in {"conditional", "stop", "stop_market", "stop_limit"}:
+                return True
+            if order.stop_price is not None:
+                return True
+        return False
 
     def _trade_is_triggered_conditional(self, trade: Trade) -> bool:
         return (

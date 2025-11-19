@@ -208,9 +208,10 @@ def custom_conditional_orders(
     current_rate: float,
     candle: dict | None = None,
     **kwargs,
-) -> tuple[str, float] | None:
+) -> tuple[str, float] | tuple[str, float, str | None] | None:
     """
-    Custom conditional order logic, returning a tuple containing direction and trigger price.
+    Custom conditional order logic, returning a tuple containing direction, trigger price,
+    and an optional enter tag to store with the resulting trade.
     Returning None removes the currently scheduled conditional order for the pair.
 
     :param pair: Pair that's currently analyzed
@@ -218,7 +219,8 @@ def custom_conditional_orders(
     :param current_rate: Rate, calculated based on pricing settings in entry_pricing.
     :param candle: The latest analyzed candle contents.
     :param **kwargs: Ensure to keep this here so updates to this won't break your strategy.
-    :return tuple[str, float] | None: Direction and trigger price.
+    :return tuple[str, float] | tuple[str, float, str | None] | None:
+        Direction, trigger price, and optional enter tag.
     """
     return None
 
