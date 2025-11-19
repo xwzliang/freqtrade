@@ -829,13 +829,19 @@ class FreqtradeBot(LoggingMixin):
                     "Executing market order instead.",
                     pair,
                 )
+                market_enter_tag = f"conditional_market_{instruction.direction.value}"
+                fallback_tag = (
+                    f"{instruction.enter_tag}_{market_enter_tag}"
+                    if instruction.enter_tag
+                    else market_enter_tag
+                )
                 placed = self.execute_entry(
                     pair=pair,
                     stake_amount=stake_amount,
                     price=None,
                     is_short=instruction.direction == SignalDirection.SHORT,
                     ordertype="market",
-                    enter_tag=f"conditional_market_{instruction.direction.value}",
+                    enter_tag=fallback_tag,
                 )
                 if not placed:
                     self._log_conditional_skip(pair, "market fallback rejected")

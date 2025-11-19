@@ -1502,6 +1502,29 @@ def test_conditional_order_market_fallback(mocker, default_conf_usdt) -> None:
 
 
 @pytest.mark.usefixtures("init_persistence")
+def test_conditional_order_market_fallback_custom_tag(mocker, default_conf_usdt) -> None:
+    freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
+    freqtrade.strategy.conditional_order_market_fallback = True
+    freqtrade.strategy.custom_conditional_orders = MagicMock(
+        return_value=(SignalDirection.SHORT, 90.0, "my_custom_conditional"),
+    )
+    mocker.patch(f"{EXMS}.get_rate", MagicMock(return_value=100.0))
+    exec_mock = mocker.patch.object(
+        freqtrade,
+        "execute_entry",
+        side_effect=[InvalidOrderException("Order would immediately trigger."), True],
+    )
+
+    assert freqtrade.create_trade("ETH/USDT")
+    assert exec_mock.call_count == 2
+    assert exec_mock.call_args_list[0][1]["enter_tag"] == "my_custom_conditional"
+    assert (
+        exec_mock.call_args_list[1][1]["enter_tag"]
+        == "my_custom_conditional_conditional_market_short"
+    )
+
+
+@pytest.mark.usefixtures("init_persistence")
 def test_handle_replace_order_conditional_sets_trigger(mocker, default_conf_usdt) -> None:
     freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
     trade = Trade(
