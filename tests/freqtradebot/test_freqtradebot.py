@@ -1525,6 +1525,50 @@ def test_conditional_order_market_fallback_custom_tag(mocker, default_conf_usdt)
 
 
 @pytest.mark.usefixtures("init_persistence")
+def test_conditional_market_fallback_trade_blocks_direction(mocker, default_conf_usdt) -> None:
+    freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
+    trade = Trade(
+        pair="ETH/USDT",
+        stake_amount=10.0,
+        fee_open=0.0,
+        fee_close=0.0,
+        is_open=True,
+        amount=1.0,
+        open_rate=100.0,
+        exchange="binance",
+        open_date=dt_now(),
+        is_short=False,
+        enter_tag="my_custom_conditional_conditional_market_long",
+    )
+    fallback_order = Order.parse_from_ccxt_object(
+        {
+            "id": "market_fallback",
+            "status": "closed",
+            "type": "market",
+            "side": "buy",
+            "amount": 1.0,
+            "filled": 1.0,
+            "remaining": 0.0,
+            "price": 100.0,
+            "average": 100.0,
+            "cost": 100.0,
+        },
+        trade.pair,
+        trade.entry_side,
+    )
+    fallback_order.ft_order_tag = trade.enter_tag
+    fallback_order.ft_is_open = False
+    trade.orders.append(fallback_order)
+    Trade.session.add(trade)
+    Trade.commit()
+
+    assert freqtrade._trade_uses_conditional_entry(trade)
+    assert freqtrade._conditional_direction_blocked(
+        trade.pair, SignalDirection.LONG, open_trades_snapshot=[trade]
+    )
+
+
+@pytest.mark.usefixtures("init_persistence")
 def test_handle_replace_order_conditional_sets_trigger(mocker, default_conf_usdt) -> None:
     freqtrade = _setup_conditional_bot(mocker, default_conf_usdt)
     trade = Trade(

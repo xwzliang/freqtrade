@@ -1065,8 +1065,11 @@ class FreqtradeBot(LoggingMixin):
 
     @staticmethod
     def _trade_uses_conditional_entry(trade: Trade) -> bool:
-        if isinstance(trade.enter_tag, str) and trade.enter_tag.startswith("conditional"):
-            return True
+        if isinstance(trade.enter_tag, str):
+            if trade.enter_tag.startswith("conditional"):
+                return True
+            if "conditional_market_" in trade.enter_tag:
+                return True
         for order in trade.orders:
             if order.ft_order_side != trade.entry_side:
                 continue
@@ -1074,6 +1077,8 @@ class FreqtradeBot(LoggingMixin):
             if order_type in {"conditional", "stop", "stop_market", "stop_limit"}:
                 return True
             if order.stop_price is not None:
+                return True
+            if isinstance(order.ft_order_tag, str) and "conditional_market_" in order.ft_order_tag:
                 return True
         return False
 
