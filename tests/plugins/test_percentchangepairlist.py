@@ -1,3 +1,4 @@
+from copy import deepcopy
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
@@ -345,6 +346,246 @@ def test_filter_pairlist_with_max_value_set(mocker, rpl_config, tickers, time_ma
     assert result == ["ETH/USDT"]
 
 
+def test_use_candle_any_match_high_low_option(mocker, rpl_config, tickers, time_machine):
+    base_pairlist = {
+        "method": "PercentChangePairList",
+        "number_assets": 5,
+        "sort_key": "percentage",
+        "min_value": 30,
+        "max_value": -30,
+        "refresh_period": 86400,
+        "use_candle_any_match": True,
+        "lookback_timeframe": "1d",
+        "lookback_period": 2,
+    }
+    config_plain = deepcopy(rpl_config)
+    config_plain["pairlists"] = [deepcopy(base_pairlist)]
+    config_wick = deepcopy(config_plain)
+    config_wick["pairlists"][0]["use_candle_any_match_high_low"] = True
+
+    start = datetime(2024, 8, 1, 0, 0, 0, 0, tzinfo=UTC)
+    time_machine.move_to(start, tick=False)
+
+    dates = pd.date_range("2024-07-01", periods=2, freq="1D", tz="UTC")
+    mock_ohlcv_data = {
+        ("ETH/USDT", "1d", CandleType.SPOT): pd.DataFrame(
+            {
+                "date": dates,
+                "open": [100, 100],
+                "high": [100, 150],
+                "low": [100, 70],
+                "close": [100, 101],
+                "volume": [1000, 1200],
+            }
+        ),
+        ("XRP/USDT", "1d", CandleType.SPOT): pd.DataFrame(
+            {
+                "date": dates,
+                "open": [100, 100],
+                "high": [101, 105],
+                "low": [99, 98],
+                "close": [100, 100],
+                "volume": [900, 950],
+            }
+        ),
+    }
+
+    mocker.patch(f"{EXMS}.refresh_latest_ohlcv", MagicMock(return_value=mock_ohlcv_data))
+
+    exchange_plain = get_patched_exchange(mocker, config_plain, exchange="binance")
+    pairlistmanager_plain = PairListManager(exchange_plain, config_plain)
+    pairlist_plain = PercentChangePairList(
+        exchange_plain, pairlistmanager_plain, config_plain, config_plain["pairlists"][0], 0
+    )
+    result_plain = pairlist_plain.filter_pairlist(
+        config_plain["exchange"]["pair_whitelist"], {}
+    )
+    assert result_plain == []
+
+    exchange_wick = get_patched_exchange(mocker, config_wick, exchange="binance")
+    pairlistmanager_wick = PairListManager(exchange_wick, config_wick)
+    pairlist_wick = PercentChangePairList(
+        exchange_wick, pairlistmanager_wick, config_wick, config_wick["pairlists"][0], 0
+    )
+    result_wick = pairlist_wick.filter_pairlist(
+        config_wick["exchange"]["pair_whitelist"], {}
+    )
+    assert result_wick == ["ETH/USDT"]
+
+
+def test_high_low_cache_normalization_drops_plain_percentages(
+    mocker, rpl_config, tickers, time_machine
+):
+    config = deepcopy(rpl_config)
+    config["pairlists"] = [
+        {
+            "method": "PercentChangePairList",
+            "number_assets": 5,
+            "sort_key": "percentage",
+            "min_value": 30,
+            "max_value": -30,
+            "refresh_period": 86400,
+            "use_candle_any_match": True,
+            "use_candle_any_match_high_low": True,
+            "lookback_timeframe": "1d",
+            "lookback_period": 2,
+        }
+    ]
+    exchange = get_patched_exchange(mocker, config, exchange="binance")
+    pairlistmanager = PairListManager(exchange, config)
+    pairlist = PercentChangePairList(
+        exchange, pairlistmanager, config, config["pairlists"][0], 0
+    )
+
+    raw = {
+        "ETH/USDT": {
+            "percentage": None,
+            "percentages": {
+                "2024-07-01T00:00:00+00:00": 5.0,
+                "2024-07-02T00:00:00+00:00": {"high": 25.0, "low": -10.0},
+            },
+            "dates": [
+                "2024-07-01T00:00:00+00:00",
+                "2024-07-02T00:00:00+00:00",
+            ],
+            "last_candle": "2024-07-02T00:00:00+00:00",
+            "cached_at": "2024-07-03T00:00:00+00:00",
+        }
+    }
+
+    normalized = pairlist._normalize_cache_payload(raw)
+    entry = normalized["ETH/USDT"]
+    assert "2024-07-01T00:00:00+00:00" not in entry["percentages"]
+    assert "2024-07-02T00:00:00+00:00" in entry["percentages"]
+
+
+def test_use_candle_any_match_high_low_refreshes_legacy_cache(
+    mocker, rpl_config, tickers, time_machine
+):
+    rpl_config = deepcopy(rpl_config)
+    rpl_config["pairlists"] = [
+        {
+            "method": "PercentChangePairList",
+            "number_assets": 5,
+            "sort_key": "percentage",
+            "min_value": 30,
+            "max_value": -30,
+            "refresh_period": 86400,
+            "use_candle_any_match": True,
+            "use_candle_any_match_high_low": True,
+            "lookback_timeframe": "1d",
+            "lookback_period": 2,
+        }
+    ]
+
+    start = datetime(2024, 8, 1, 0, 0, 0, 0, tzinfo=UTC)
+    time_machine.move_to(start, tick=False)
+
+    dates = pd.date_range("2024-07-01", periods=2, freq="1D", tz="UTC")
+    mock_ohlcv_data = {
+        ("ETH/USDT", "1d", CandleType.SPOT): pd.DataFrame(
+            {
+                "date": dates,
+                "open": [100, 100],
+                "high": [100, 150],
+                "low": [100, 70],
+                "close": [100, 101],
+                "volume": [1000, 1200],
+            }
+        )
+    }
+
+    refresh_mock = mocker.patch(
+        f"{EXMS}.refresh_latest_ohlcv", MagicMock(return_value=mock_ohlcv_data)
+    )
+
+    exchange = get_patched_exchange(mocker, rpl_config, exchange="binance")
+    pairlistmanager = PairListManager(exchange, rpl_config)
+    pairlist = PercentChangePairList(
+        exchange, pairlistmanager, rpl_config, rpl_config["pairlists"][0], 0
+    )
+
+    pairlist._load_lookback_cache = MagicMock()
+    pairlist._save_lookback_cache = MagicMock()
+    legacy_date = datetime(2024, 7, 31, tzinfo=UTC).isoformat()
+    pairlist._lookback_cache_data = {
+        "ETH/USDT": {
+            "percentage": None,
+            "percentages": {
+                legacy_date: 5.0,
+            },
+            "dates": [legacy_date],
+            "last_candle": legacy_date,
+            "cached_at": start.isoformat(),
+        }
+    }
+
+    result = pairlist.filter_pairlist(rpl_config["exchange"]["pair_whitelist"], {})
+
+    assert refresh_mock.call_count > 0
+    assert result == ["ETH/USDT"]
+    payload = pairlist._lookback_cache_data["ETH/USDT"]
+    assert payload["dates"]
+    assert isinstance(payload["percentages"][payload["dates"][-1]], dict)
+
+
+def test_use_candle_any_match_high_low_uses_intraday_reference(
+    mocker, rpl_config, tickers, time_machine
+):
+    config = deepcopy(rpl_config)
+    config["pairlists"] = [
+        {
+            "method": "PercentChangePairList",
+            "number_assets": 5,
+            "sort_key": "percentage",
+            "min_value": 25,
+            "max_value": -25,
+            "refresh_period": 86400,
+            "use_candle_any_match": True,
+            "use_candle_any_match_high_low": True,
+            "lookback_timeframe": "1d",
+            "lookback_period": 2,
+        }
+    ]
+
+    start = datetime(2024, 8, 1, 0, 0, 0, 0, tzinfo=UTC)
+    time_machine.move_to(start, tick=False)
+
+    dates = pd.date_range("2024-07-01", periods=2, freq="1D", tz="UTC")
+    mock_ohlcv_data = {
+        ("ETH/USDT", "1d", CandleType.SPOT): pd.DataFrame(
+            {
+                "date": dates,
+                "open": [130, 100],
+                "high": [131, 101],
+                "low": [129, 90],
+                "close": [130, 100],
+                "volume": [1000, 1200],
+            }
+        ),
+        ("XRP/USDT", "1d", CandleType.SPOT): pd.DataFrame(
+            {
+                "date": dates,
+                "open": [100, 100],
+                "high": [101, 101],
+                "low": [99, 99],
+                "close": [100, 100],
+                "volume": [800, 750],
+            }
+        ),
+    }
+
+    mocker.patch(f"{EXMS}.refresh_latest_ohlcv", MagicMock(return_value=mock_ohlcv_data))
+
+    exchange = get_patched_exchange(mocker, config, exchange="binance")
+    pairlistmanager = PairListManager(exchange, config)
+    pairlist = PercentChangePairList(
+        exchange, pairlistmanager, config, config["pairlists"][0], 0
+    )
+
+    result = pairlist.filter_pairlist(config["exchange"]["pair_whitelist"], {})
+
+    assert result == []
 def test_gen_pairlist_from_tickers(mocker, rpl_config, tickers):
     rpl_config["pairlists"] = [
         {

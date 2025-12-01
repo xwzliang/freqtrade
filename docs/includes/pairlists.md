@@ -242,6 +242,9 @@ The percent change in price is calculated using the following formula, which exp
 
 $$ Percent Change = (\frac{Current Close - Previous Close}{Previous Close}) * 100 $$
 
+!!! Tip "Use wick ranges when matching candles"
+    When `use_candle_any_match` is enabled you can add `"use_candle_any_match_high_low": true` to the configuration to base the match on each candle's high/low range instead of only its open and close values. With this flag enabled the wick percentages are calculated relative to the candle's open price (falling back to close data when necessary), which ensures the intraperiod spike is measured from the same candle rather than the previous close. This makes it possible to include pairs where the intraperiod spike met the configured `min_value`/`max_value` even if the candle closed back near the starting price.
+
 !!! Warning "Range look back and refresh period"
     When used in conjunction with `lookback_days` and `lookback_timeframe` the `refresh_period` can not be smaller than the candle size in seconds. As this will result in unnecessary requests to the exchanges API.
 

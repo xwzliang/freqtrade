@@ -71,7 +71,14 @@ class PercentChangePairList(IPairList):
         self._lookback_cache_suffix = str(
             getattr(self._def_candletype, "value", self._def_candletype)
         )
-        self._use_candle_any_match: bool = self._pairlistconfig.get("use_candle_any_match", False)
+        self._use_candle_any_match: bool = bool(
+            self._pairlistconfig.get("use_candle_any_match", False)
+        )
+        self._use_candle_any_match_high_low: bool = bool(
+            self._pairlistconfig.get("use_candle_any_match_high_low", False)
+        )
+        if self._use_candle_any_match and self._use_candle_any_match_high_low:
+            self._lookback_cache_suffix = f"{self._lookback_cache_suffix}_wick"
         lookback_cache_dir_cfg = self._pairlistconfig.get(
             "lookback_cache_dir", "/freqtrade/user_data/percent_lookback"
         )
@@ -245,6 +252,12 @@ class PercentChangePairList(IPairList):
                 "default": False,
                 "description": "Select pairs if any candle in the lookback window matches thresholds.",
                 "help": "When enabled, a single candle exceeding the configured limits is enough to include the pair.",
+            },
+            "use_candle_any_match_high_low": {
+                "type": "boolean",
+                "default": False,
+                "description": "Evaluate candle highs and lows when matching ranges.",
+                "help": "When use_candle_any_match is enabled, check both wick extremes instead of only close-to-close changes.",
             },
             "lookback_cache_dir": {
                 "type": "string",
@@ -600,6 +613,22 @@ class PercentChangePairList(IPairList):
             for entry in filtered_tickers:
                 symbol = entry["symbol"]
                 cache_entry = self._lookback_cache_data.get(symbol)
+                needs_wick_refresh = False
+                if (
+                    cache_entry
+                    and self._use_candle_any_match_high_low
+                    and not self._cache_supports_high_low(cache_entry)
+                ):
+                    needs_wick_refresh = True
+                    self._lookback_cache_data.pop(symbol, None)
+                    self._percentage_cache.pop(symbol, None)
+                    cache_entry = None
+                    self.log_once(
+                        f"PercentChangePairList refreshing cached data for {symbol} "
+                        "to include high/low wick ranges.",
+                        logger.info,
+                    )
+
                 is_time_fresh = False
                 if cache_entry and expected_min_last_iso:
                     last_candle = cache_entry.get("last_candle")
@@ -609,9 +638,19 @@ class PercentChangePairList(IPairList):
                     )
 
                 # "fresh" only if both: within refresh window AND covers latest completed bar
-                if self._is_cache_entry_fresh(cache_entry, refresh_delta, now_dt) and is_time_fresh:
-                    selected_pct, ordered_values = self._evaluate_cached_percentages(cache_entry)
-                    if self._lookback_period > 0 and len(ordered_values) < self._lookback_period:
+                if (
+                    cache_entry
+                    and not needs_wick_refresh
+                    and self._is_cache_entry_fresh(cache_entry, refresh_delta, now_dt)
+                    and is_time_fresh
+                ):
+                    (
+                        selected_pct,
+                        ordered_values,
+                        candle_count,
+                        match_date,
+                    ) = self._evaluate_cached_percentages(cache_entry)
+                    if self._lookback_period > 0 and candle_count < self._lookback_period:
                         symbols_to_fetch.add(symbol)
                         continue
                     cache_entry["percentage"] = selected_pct
@@ -620,14 +659,16 @@ class PercentChangePairList(IPairList):
                     cached_symbols.add(symbol)
                     if selected_pct is not None:
                         logger.info(
-                            "PercentChangePairList: using cached percentage %.3f for %s.",
+                            "PercentChangePairList: using cached percentage %.3f for %s%s.",
                             selected_pct,
                             symbol,
+                            f" from candle {match_date}" if match_date else "",
                         )
                     else:
-                        self._log_no_candle_match(symbol, ordered_values)
+                        self._log_no_candle_match(symbol, ordered_values, candle_count)
                 else:
                     symbols_to_fetch.add(symbol)
+                    continue
 
             if cached_symbols:
                 logger.info(
@@ -662,6 +703,11 @@ class PercentChangePairList(IPairList):
             if self._use_candle_any_match:
                 dates, percentage_map = self._build_percentage_payload(pair_candles)
                 existing_entry = self._lookback_cache_data.get(symbol, {})
+                if (
+                    self._use_candle_any_match_high_low
+                    and not self._cache_supports_high_low(existing_entry)
+                ):
+                    existing_entry = {}
                 merged_percentages = dict(existing_entry.get("percentages", {}))
                 merged_percentages.update(percentage_map)
                 merged_dates = sorted(
@@ -670,13 +716,22 @@ class PercentChangePairList(IPairList):
                 merged_dates, merged_percentages = self._apply_cache_limit(
                     merged_percentages, merged_dates
                 )
-                merged_entries = [
-                    (d, merged_percentages[d]) for d in merged_dates if d in merged_percentages
-                ]
-                if self._lookback_period > 0 and len(merged_entries) > self._lookback_period:
-                    merged_entries = merged_entries[-self._lookback_period :]
-                    merged_dates = [d for d, _ in merged_entries]
-                selected_pct, all_values = self._select_percentage_from_entries(merged_entries)
+                merged_entries = []
+                for d in merged_dates:
+                    if d not in merged_percentages:
+                        continue
+                    merged_entries.extend(
+                        self._expand_percentage_entries(d, merged_percentages[d])
+                    )
+                if self._lookback_period > 0 and merged_entries:
+                    merged_entries = self._trim_entries_to_lookback(merged_entries)
+                merged_dates = self._extract_dates_from_entries(merged_entries)
+                (
+                    selected_pct,
+                    all_values,
+                    candle_count,
+                    match_date,
+                ) = self._select_percentage_from_entries(merged_entries)
 
                 updated_ts = dt_now().isoformat()
                 payload = {
@@ -692,14 +747,16 @@ class PercentChangePairList(IPairList):
                 cache_updated = True
                 if selected_pct is not None:
                     logger.info(
-                        "PercentChangePairList: %s matched candle change %.3f%% (range %.3f%% to %.3f%%).",
+                        "PercentChangePairList: %s matched candle change %.3f%% "
+                        "(range %.3f%% to %.3f%%) from candle %s.",
                         symbol,
                         selected_pct,
                         min(all_values) if all_values else 0.0,
                         max(all_values) if all_values else 0.0,
+                        match_date or "unknown",
                     )
                 else:
-                    self._log_no_candle_match(symbol, all_values)
+                    self._log_no_candle_match(symbol, all_values, candle_count)
             else:
                 cache_entry = self._percentage_cache.get(symbol)
                 if cache_entry and cache_entry.get("last_candle") == latest_date_key:
@@ -917,6 +974,109 @@ class PercentChangePairList(IPairList):
                 pct = 0.0
         return pct
 
+    def _get_candle_reference_price(self, candles: DataFrame, idx: int) -> float | None:
+        reference = None
+        try:
+            open_price = float(candles.iloc[idx]["open"])
+            if open_price > 0 and math.isfinite(open_price):
+                reference = open_price
+        except (KeyError, TypeError, ValueError):
+            reference = None
+
+        if reference is None:
+            try:
+                close_price = float(candles.iloc[idx]["close"])
+                if close_price > 0 and math.isfinite(close_price):
+                    reference = close_price
+            except (KeyError, TypeError, ValueError):
+                reference = None
+
+        if reference is None and idx > 0:
+            try:
+                prev_close = float(candles.iloc[idx - 1]["close"])
+                if prev_close > 0 and math.isfinite(prev_close):
+                    reference = prev_close
+            except (KeyError, TypeError, ValueError):
+                reference = None
+
+        return reference
+
+    def _calc_candle_high_low_percentages(
+        self, candles: DataFrame, idx: int
+    ) -> dict[str, float]:
+        reference = self._get_candle_reference_price(candles, idx)
+        if reference is None or reference <= 0 or not math.isfinite(reference):
+            return {}
+
+        values: dict[str, float] = {}
+        try:
+            high_price = float(candles.iloc[idx]["high"])
+            if math.isfinite(high_price):
+                values["high"] = ((high_price - reference) / reference) * 100
+        except (KeyError, TypeError, ValueError):
+            pass
+
+        try:
+            low_price = float(candles.iloc[idx]["low"])
+            if math.isfinite(low_price):
+                values["low"] = ((low_price - reference) / reference) * 100
+        except (KeyError, TypeError, ValueError):
+            pass
+
+        if not values:
+            values["close"] = self._calc_candle_percentage(candles, idx)
+        return values
+
+    def _expand_percentage_entries(
+        self, key: str, raw_value: Any
+    ) -> list[tuple[str, float]]:
+        entries: list[tuple[str, float]] = []
+        if isinstance(raw_value, dict):
+            for _, nested_value in raw_value.items():
+                try:
+                    entries.append((key, float(nested_value)))
+                except (TypeError, ValueError):
+                    continue
+        else:
+            try:
+                entries.append((key, float(raw_value)))
+            except (TypeError, ValueError):
+                return []
+        return entries
+
+    def _trim_entries_to_lookback(
+        self, entries: list[tuple[str, float]]
+    ) -> list[tuple[str, float]]:
+        if self._lookback_period <= 0 or not entries:
+            return entries
+        candle_order: list[str] = []
+        for key, _ in entries:
+            if not candle_order or candle_order[-1] != key:
+                candle_order.append(key)
+        keep_keys: list[str] = []
+        for key in reversed(candle_order):
+            keep_keys.append(key)
+            if len(keep_keys) >= self._lookback_period:
+                break
+        keep_set = set(keep_keys)
+        trimmed = [(key, pct) for key, pct in entries if key in keep_set]
+        return trimmed
+
+    def _extract_dates_from_entries(self, entries: list[tuple[str, float]]) -> list[str]:
+        dates: list[str] = []
+        for key, _ in entries:
+            if not dates or dates[-1] != key:
+                dates.append(key)
+        return dates
+
+    def _cache_supports_high_low(self, entry: dict[str, Any] | None) -> bool:
+        if not entry or not isinstance(entry, dict):
+            return False
+        percentages = entry.get("percentages")
+        if not isinstance(percentages, dict) or not percentages:
+            return False
+        return all(isinstance(val, dict) for val in percentages.values())
+
     def _normalize_candle_timestamp(self, candle_ts: Any) -> str | None:
         if isinstance(candle_ts, Timestamp):
             ts = candle_ts
@@ -976,13 +1136,23 @@ class PercentChangePairList(IPairList):
             if not isinstance(value, dict):
                 continue
             percentages_raw = value.get("percentages") or {}
-            percentages: dict[str, float] = {}
+            percentages: dict[str, Any] = {}
             if isinstance(percentages_raw, dict):
                 for p_key, p_val in percentages_raw.items():
-                    try:
-                        percentages[str(p_key)] = float(p_val)
-                    except (TypeError, ValueError):
-                        continue
+                    key_str = str(p_key)
+                    if isinstance(p_val, dict):
+                        nested: dict[str, float] = {}
+                        for nested_key, nested_val in p_val.items():
+                            try:
+                                nested[str(nested_key)] = float(nested_val)
+                            except (TypeError, ValueError):
+                                continue
+                        percentages[key_str] = nested
+                    else:
+                        try:
+                            percentages[key_str] = float(p_val)
+                        except (TypeError, ValueError):
+                            continue
 
             dates_raw = value.get("dates", [])
             dates_list: list[str] = []
@@ -994,6 +1164,11 @@ class PercentChangePairList(IPairList):
                         dates_list.append(str(item))
             all_dates = sorted(set(dates_list) | set(percentages.keys()))
             ordered_percentages = {d: percentages[d] for d in all_dates if d in percentages}
+            if self._use_candle_any_match_high_low and ordered_percentages:
+                ordered_percentages = {
+                    d: val for d, val in ordered_percentages.items() if isinstance(val, dict)
+                }
+                all_dates = [d for d in all_dates if d in ordered_percentages]
 
             percentage_val = value.get("percentage")
             try:
@@ -1052,8 +1227,8 @@ class PercentChangePairList(IPairList):
         return base
 
     def _apply_cache_limit(
-        self, percentages: dict[str, float], dates: list[str]
-    ) -> tuple[list[str], dict[str, float]]:
+        self, percentages: dict[str, Any], dates: list[str]
+    ) -> tuple[list[str], dict[str, Any]]:
         if not dates:
             dates = list(percentages.keys())
         unique_dates = sorted(dict.fromkeys(dates))
@@ -1080,7 +1255,7 @@ class PercentChangePairList(IPairList):
             return first if first_dt >= second_dt else second
         return first or second
 
-    def _build_percentage_payload(self, candles: DataFrame) -> tuple[list[str], dict[str, float]]:
+    def _build_percentage_payload(self, candles: DataFrame) -> tuple[list[str], dict[str, Any]]:
         total = len(candles.index)
         if total == 0:
             return [], {}
@@ -1091,29 +1266,50 @@ class PercentChangePairList(IPairList):
             start_idx = 0
 
         dates: list[str] = []
-        percentages: dict[str, float] = {}
+        percentages: dict[str, Any] = {}
         for idx in range(start_idx, total):
             iso_ts = self._normalize_candle_timestamp(candles.iloc[idx]["date"])
             if iso_ts is None:
                 continue
-            pct = self._calc_candle_percentage(candles, idx)
-            percentages[iso_ts] = pct
+            if self._use_candle_any_match and self._use_candle_any_match_high_low:
+                payload = self._calc_candle_high_low_percentages(candles, idx)
+                if not payload:
+                    payload = {"close": self._calc_candle_percentage(candles, idx)}
+                percentages[iso_ts] = payload
+            else:
+                pct = self._calc_candle_percentage(candles, idx)
+                percentages[iso_ts] = pct
             dates.append(iso_ts)
         return dates, percentages
 
     def _select_percentage_from_entries(
         self, entries: list[tuple[str, float]]
-    ) -> tuple[float | None, list[float]]:
-        values = [float(pct) for _, pct in entries if math.isfinite(pct)]
+    ) -> tuple[float | None, list[float], int, str | None]:
+        values: list[float] = []
+        candle_order: list[str] = []
+        selected: float | None = None
+        match_date: str | None = None
+        for key, pct in entries:
+            if not candle_order or candle_order[-1] != key:
+                candle_order.append(key)
+            try:
+                pct_val = float(pct)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(pct_val):
+                continue
+            values.append(pct_val)
+            if self._percentage_matches(pct_val):
+                selected = pct_val
+                match_date = key
+        candle_count = len(set(candle_order))
         if not values:
-            return None, []
-        matches = [pct for pct in values if self._percentage_matches(pct)]
-        selected = matches[-1] if matches else None
-        return selected, values
+            return None, [], candle_count, None
+        return selected, values, candle_count, match_date
 
     def _evaluate_cached_percentages(
         self, cache_entry: dict[str, Any]
-    ) -> tuple[float | None, list[float]]:
+    ) -> tuple[float | None, list[float], int, str | None]:
         dates = cache_entry.get("dates") or []
         percentages_map = cache_entry.get("percentages") or {}
         if not isinstance(percentages_map, dict):
@@ -1122,29 +1318,25 @@ class PercentChangePairList(IPairList):
         ordered: list[tuple[str, float]] = []
         if dates and isinstance(dates, list):
             for key in dates:
-                try:
-                    val = float(percentages_map.get(key))
-                except (TypeError, ValueError):
-                    continue
-                ordered.append((key, val))
+                ordered.extend(self._expand_percentage_entries(key, percentages_map.get(key)))
         else:
-            for key, val in sorted(percentages_map.items()):
-                try:
-                    ordered.append((key, float(val)))
-                except (TypeError, ValueError):
-                    continue
+            for key in sorted(percentages_map.keys()):
+                ordered.extend(self._expand_percentage_entries(key, percentages_map.get(key)))
 
-        if self._lookback_period > 0 and len(ordered) > self._lookback_period:
-            ordered = ordered[-self._lookback_period :]
+        if self._lookback_period > 0 and ordered:
+            ordered = self._trim_entries_to_lookback(ordered)
 
-        selected, values = self._select_percentage_from_entries(ordered)
-        return selected, values
+        selected, values, candle_count, match_date = self._select_percentage_from_entries(ordered)
+        return selected, values, candle_count, match_date
 
-    def _log_no_candle_match(self, symbol: str, values: list[float]) -> None:
+    def _log_no_candle_match(
+        self, symbol: str, values: list[float], candle_count: int | None = None
+    ) -> None:
+        periods = candle_count if candle_count is not None and candle_count > 0 else len(values)
         if values:
             self.log_once(
                 f"Removed {symbol} from whitelist, because no candle in the last "
-                f"{len(values)} {self._lookback_timeframe} periods matched the configured range. "
+                f"{periods} {self._lookback_timeframe} periods matched the configured range. "
                 f"Observed range {min(values):.3f}% to {max(values):.3f}%.",
                 logger.info,
             )
