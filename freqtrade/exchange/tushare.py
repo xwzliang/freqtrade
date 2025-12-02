@@ -106,7 +106,8 @@ class Tushare(Exchange):
     ]
 
     # Officially documented timeframe diff between days is the only stable option for daily data
-    _SUPPORTED_TIMEFRAMES: dict[str, str] = {"1d": "1d"}
+    _SUPPORTED_TIMEFRAMES: dict[str, str] = {"1d": "1d", "1M": "1M"}
+    _AGGREGATED_TIMEFRAMES: set[str] = {"1M"}
     _DEFAULT_QUOTE = "CNY"
 
     def __init__(self, *args, **kwargs) -> None:
@@ -584,6 +585,9 @@ class Tushare(Exchange):
         if cached_ticks is not None:
             return cached_ticks
 
+        if timeframe == "1M":
+            return self._aggregate_monthly_from_daily_cache(pair, since_ms, until_ms)
+
         key = (pair, timeframe, candle_type)
         cached_df_full = self._klines.get(key)
         last_cached_market_date: dt_date | None = None
@@ -681,6 +685,77 @@ class Tushare(Exchange):
 
         return ticks
 
+    def _build_monthly_dataframe_from_daily_cache(self, pair: str) -> DataFrame:
+        """
+        Construct a monthly dataframe derived from cached daily candles.
+        """
+        daily_df = self._get_cached_dataframe(pair, "1d")
+        if daily_df.empty or "date" not in daily_df.columns:
+            logger.warning(
+                "Cannot build monthly OHLCV for %s - cached daily data is unavailable.", pair
+            )
+            return DataFrame()
+
+        df = daily_df.copy()
+        df["date"] = to_datetime(df["date"], utc=True)
+        if "volume" not in df.columns:
+            if "vol" in df.columns:
+                df["volume"] = df["vol"]
+            else:
+                df["volume"] = 0.0
+        df["volume"] = df["volume"].fillna(0)
+
+        df = df.set_index("date")
+        monthly_df = (
+            df.resample("MS", label="left", closed="left")
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }
+            )
+            .dropna(subset=["open", "high", "low", "close"])
+        )
+        monthly_df = monthly_df.reset_index()
+        if monthly_df.empty:
+            return monthly_df
+        monthly_df["date"] = to_datetime(monthly_df["date"], utc=True)
+        monthly_df = monthly_df.sort_values("date").reset_index(drop=True)
+        return monthly_df
+
+    def _aggregate_monthly_from_daily_cache(
+        self,
+        pair: str,
+        since_ms: int | None,
+        until_ms: int | None,
+    ) -> list[list]:
+        """
+        Build 1M OHLCV data purely from cached 1d candles without touching the API.
+        """
+        agg = self._build_monthly_dataframe_from_daily_cache(pair)
+        if agg.empty:
+            return []
+
+        agg = agg.copy()
+        since_dt = datetime.fromtimestamp(since_ms / 1000, tz=UTC) if since_ms else None
+        until_dt = datetime.fromtimestamp(until_ms / 1000, tz=UTC) if until_ms else None
+        if since_dt:
+            agg = agg[agg["date"] >= since_dt]
+        if until_dt:
+            agg = agg[agg["date"] <= until_dt]
+
+        if agg.empty:
+            return []
+
+        ticks: list[list] = []
+        for row in agg.itertuples(index=False):
+            ts = int(row.date.timestamp() * 1000)
+            ticks.append([ts, row.open, row.high, row.low, row.close, row.volume])
+        return ticks
+
     def _ms_to_trade_date(self, ms: int | None) -> str | None:
         if not ms:
             return None
@@ -692,9 +767,21 @@ class Tushare(Exchange):
         if df is not None and not df.empty:
             return df
 
+        aggregated_failed = False
+        if timeframe in self._AGGREGATED_TIMEFRAMES:
+            agg_df = self._build_monthly_dataframe_from_daily_cache(pair)
+            if not agg_df.empty:
+                self._klines[key] = agg_df
+                self._store_cached_dataframe(pair, timeframe, agg_df)
+                return agg_df
+            aggregated_failed = True
+
         try:
             df = self._datahandler.ohlcv_load(
-                pair, timeframe, candle_type=CandleType.SPOT
+                pair,
+                timeframe,
+                candle_type=CandleType.SPOT,
+                warn_no_data=(timeframe not in self._AGGREGATED_TIMEFRAMES) or aggregated_failed,
             )
         except FileNotFoundError:
             df = DataFrame()
