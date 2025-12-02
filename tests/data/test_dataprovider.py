@@ -350,8 +350,18 @@ def test_consumer_use_producer_ohlcv(mocker, default_conf, ohlcv_history):
     dp.refresh([("UNITTEST/BTC", timeframe)])
     refresh_mock.assert_not_called()
 
+    btc_pair = "BTC/USDT:USDT"
+    informative_pairs = [(btc_pair, timeframe, candle_type)]
+    exchange._klines[(btc_pair, timeframe, candle_type)] = ohlcv_history
+    dp.refresh([("UNITTEST/BTC", timeframe)], informative_pairs)
+    refresh_mock.assert_called_once_with(informative_pairs)
+    btc_df = dp.get_pair_dataframe(btc_pair, timeframe)
+    assert not btc_df.empty
+    assert btc_df.equals(ohlcv_history)
+
     available = dp.available_pairs
     assert ("UNITTEST/BTC", timeframe, candle_type) in available
+    assert (btc_pair, timeframe, candle_type) in available
 
     missing = dp.ohlcv("UNKNOWN/BTC", timeframe)
     assert missing.empty

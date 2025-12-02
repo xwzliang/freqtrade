@@ -1,7 +1,10 @@
 import logging
 from typing import Any
 
-import rapidjson
+try:
+    import rapidjson
+except ImportError:  # pragma: no cover - fallback for environments without rapidjson
+    import json as rapidjson
 
 from freqtrade.enums import RunMode
 

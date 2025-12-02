@@ -58,6 +58,7 @@ class DataProvider:
         ] = {}
         self.__producer_pairs: dict[str, list[str]] = {}
         self._msg_queue: deque = deque()
+        self._local_helping_pairs: set[PairWithTimeframe] = set()
 
         self._default_candle_type = self._config.get("candle_type_def", CandleType.SPOT)
         self._default_timeframe = self._config.get("timeframe", "1h")
@@ -479,13 +480,18 @@ class DataProvider:
         if self._exchange is None:
             raise OperationalException(NO_EXCHANGE_EXCEPTION)
         final_pairs = (pairlist + helping_pairs) if helping_pairs else pairlist
+        informative_pairs = helping_pairs or []
+        self._local_helping_pairs = set(informative_pairs)
         # refresh latest ohlcv data
         if self._use_producer_ohlcv_data and self.runmode in (RunMode.DRY_RUN, RunMode.LIVE):
             if not self._producer_ohlcv_skip_logged:
                 logger.info(
-                    "Skipping local OHLCV refresh – using producer supplied data instead."
+                    "Skipping local OHLCV refresh for whitelist – using producer supplied data "
+                    "instead. Informative pairs will still be refreshed locally."
                 )
                 self._producer_ohlcv_skip_logged = True
+            if informative_pairs:
+                self._exchange.refresh_latest_ohlcv(informative_pairs)
         else:
             self._exchange.refresh_latest_ohlcv(final_pairs)
         # refresh latest trades data
@@ -511,6 +517,8 @@ class DataProvider:
             pairs: list[PairWithTimeframe] = []
             for producer_store in self.__producer_pairs_df.values():
                 pairs.extend(producer_store.keys())
+            # Include informative pairs refreshed locally
+            pairs.extend(self._local_helping_pairs)
             # Preserve order but remove duplicates
             seen: set[PairWithTimeframe] = set()
             unique_pairs: list[PairWithTimeframe] = []
@@ -542,8 +550,12 @@ class DataProvider:
                 if candle_type != ""
                 else self._config["candle_type_def"]
             )
-
-            if self._use_producer_ohlcv_data:
+            pair_key = (pair, _timeframe, _candle_type)
+            use_producer_data = (
+                self._use_producer_ohlcv_data
+                and pair_key not in self._local_helping_pairs
+            )
+            if use_producer_data:
                 producer_names = [
                     name for name, pairs in self.__producer_pairs.items() if pair in pairs
                 ]
@@ -551,14 +563,18 @@ class DataProvider:
                     producer_names = self._producer_name_preference
 
                 df, _ = self._get_producer_df_from_names(
-                    pair, _timeframe, _candle_type, producer_names, copy=copy
+                    pair,
+                    _timeframe,
+                    _candle_type,
+                    producer_names,
+                    copy=copy,
                 )
                 return df
 
             if self._exchange is None:
                 raise OperationalException(NO_EXCHANGE_EXCEPTION)
 
-            return self._exchange.klines((pair, _timeframe, _candle_type), copy=copy)
+            return self._exchange.klines(pair_key, copy=copy)
         else:
             return DataFrame()
 
